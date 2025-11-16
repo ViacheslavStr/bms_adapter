@@ -1,0 +1,29 @@
+# PlatformIO
+.pio/
+.vscode/
+.idea/
+
+# Build files
+build/
+*.o
+*.elf
+*.bin
+*.hex
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# History
+.history/
+
