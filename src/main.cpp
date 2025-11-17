@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -100,10 +101,10 @@ void uart_transmit_output(unsigned char value)
 
 // Глобальные переменные для хранения текущих значений DP
 // В реальном проекте эти значения должны обновляться из ваших датчиков/устройства
-static unsigned long current_temperature = 45;      // Текущая температура (°C)
-static unsigned char current_status = 1;             // Текущий статус (enum)
+static unsigned long current_temperature = 42;      // Текущая температура (°C) - можно использовать rand() % 100 для случайного значения
+static unsigned char current_status = 0;             // Текущий статус (enum): 0=charging, 1=discharging, 2=fault, 3=idle
 static unsigned long current_soc = 85;               // Текущий заряд батареи (%)
-static unsigned long battery_current = 500;  // Текущий ток батареи (мА)
+static unsigned long battery_current = -130000;  // Текущий ток батареи (мА) - тестовое значение для проверки
 static unsigned long battery_voltage = 3700; // Текущее напряжение батареи (мВ)
 
 // Функция обработки всех данных (нужна для SDK)
@@ -129,12 +130,15 @@ void all_data_update(void)
     }
     
     // DPID_BATTERY_CURRENT (102) - Battery Current
-    // Range: -200-200, Scale: 3, Unit: A
-    // ВАЖНО: Scale: 3 означает, что значение нужно умножить на 1000 для отправки
-    // 500 мА = 0.5 А, отправляем 500 (0.5 * 1000)
-    unsigned long current_value = battery_current; // 500 мА = 0.5 А = 500 (с scale 3)
-    ESP_LOGI(TAG, "  → Sending DP 102 (Battery Current): %lu mA (%.3f A) -> sending %lu", 
-             battery_current, battery_current / 1000.0f, current_value);
+    // Range: -200-200, Scale: 0, Unit: A
+    // ВАЖНО: Приложение делит отправляемое значение на 1000!
+    // Если отправляем 110000, приложение показывает 110 мА (110000 / 1000 = 110)
+    // Чтобы показать 110000 мА, нужно отправить 110000 * 1000 = 110000000
+    // Или чтобы показать 110 А, нужно отправить 110 * 1000 = 110000
+    unsigned long current_value = battery_current * 1000; // Умножаем на 1000, чтобы приложение показало правильное значение
+    float current_amps = battery_current / 1000.0f; // 110000 мА = 110 А
+    ESP_LOGI(TAG, "  → Sending DP 102 (Battery Current): %lu mA (%.3f A) -> sending %lu (mA * 1000)", 
+             battery_current, current_amps, current_value);
     ret = mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
     if (ret == SUCCESS) {
         ESP_LOGI(TAG, "  ✓ DP 102 sent successfully");
@@ -144,8 +148,10 @@ void all_data_update(void)
     
     // DPID_STATUS (103) - Status (Enum)
     // Enum: charging(0), discharging(1), fault(2), idle(3)
-    // current_status = 1 означает "charging"
-    ESP_LOGI(TAG, "  → Sending DP 103 (Status): %d", current_status);
+    // current_status = 0 означает "charging", 1 = "discharging"
+    const char* status_names[] = {"charging", "discharging", "fault", "idle"};
+    ESP_LOGI(TAG, "  → Sending DP 103 (Status): %d (%s)", current_status, 
+             current_status < 4 ? status_names[current_status] : "unknown");
     ret = mcu_dp_enum_update(DPID_STATUS, current_status);
     if (ret == SUCCESS) {
         ESP_LOGI(TAG, "  ✓ DP 103 sent successfully");
@@ -155,7 +161,9 @@ void all_data_update(void)
     
     // DPID_COOK_TEMPERATURE (104) - Cook Temperature
     // Range: -50-100, Scale: 0, Unit: °C
-    ESP_LOGI(TAG, "  → Sending DP 104 (Cook Temperature): %lu°C", current_temperature);
+    // Отправляем значение как есть (45)
+    ESP_LOGI(TAG, "  → Sending DP 104 (Cook Temperature): %lu°C (raw value: %lu)", 
+             current_temperature, current_temperature);
     ret = mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
     if (ret == SUCCESS) {
         ESP_LOGI(TAG, "  ✓ DP 104 sent successfully");
@@ -165,12 +173,19 @@ void all_data_update(void)
     
     // DPID_BATTERY_VOLTAGE (105) - Battery Voltage
     // Range: 0-100, Scale: 1, Unit: V
-    // ВАЖНО: Scale: 1 означает, что значение нужно умножить на 10 для отправки
-    // 3700 мВ = 3.7 В, отправляем 37 (3.7 * 10)
-    unsigned long voltage_value = battery_voltage / 100; // 3700 мВ / 100 = 37 (3.7V * 10)
-    ESP_LOGI(TAG, "  → Sending DP 105 (Battery Voltage): %lu mV (%.2f V) -> sending %lu", 
-             battery_voltage, battery_voltage / 1000.0f, voltage_value);
+    // ВАЖНО: Scale: 1 означает 1 знак после запятой (0.1 точность)
+    // 3700 мВ = 3.7 В, с Scale: 1 отправляем 37 (3.7 * 10)
+    // Пробуем отправить в вольтах * 10
+    float voltage_volts = battery_voltage / 1000.0f; // 3700 мВ = 3.7 В
+    // Вариант 1: стандартный (3.7 В * 10 = 37)
+    unsigned long voltage_value = (unsigned long)(voltage_volts * 10); // 3.7 * 10 = 37
+    ESP_LOGI(TAG, "  → Sending DP 105 (Battery Voltage): %lu mV (%.2f V) -> sending %lu (V*10)", 
+             battery_voltage, voltage_volts, voltage_value);
     ret = mcu_dp_value_update(DPID_BATTERY_VOLTAGE, voltage_value);
+    
+    // Если все еще показывает 0.0V, попробуйте раскомментировать один из вариантов ниже:
+    // unsigned long voltage_value = (unsigned long)(voltage_volts * 100); // 370 (V*100)
+    // unsigned long voltage_value = battery_voltage / 10; // 370 (мВ/10)
     if (ret == SUCCESS) {
         ESP_LOGI(TAG, "  ✓ DP 105 sent successfully");
     } else {
@@ -204,8 +219,9 @@ void update_battery_data(unsigned long soc, unsigned long current, unsigned long
     battery_voltage = voltage;
     
     mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
-    mcu_dp_value_update(DPID_BATTERY_CURRENT, battery_current); // Scale: 3, уже в правильном формате
-    mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage / 100); // Scale: 1, вольты * 10
+    // Отправляем Battery Current, умножая на 1000 (приложение делит на 1000)
+    mcu_dp_value_update(DPID_BATTERY_CURRENT, battery_current * 1000);
+    mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage); // Scale: 1, вольты * 10
     
     ESP_LOGI(TAG, "Battery data updated: SOC=%lu%%, I=%lu mA, U=%lu mV", 
              current_soc, battery_current, battery_voltage);
@@ -348,8 +364,9 @@ extern "C" void app_main(void)
     
     ESP_LOGI(TAG, "Starting main loop...");
     ESP_LOGI(TAG, "Waiting for heartbeat from WBR3...");
+    ESP_LOGI(TAG, "Current UART speed: %d baud", WBR3_UART_BAUD);
     ESP_LOGI(TAG, "If no data received, check:");
-    ESP_LOGI(TAG, "  1. UART speed matches WBR3 (try 9600 or 115200)");
+    ESP_LOGI(TAG, "  1. UART speed matches WBR3 (currently %d, change WBR3_UART_BAUD if needed)", WBR3_UART_BAUD);
     ESP_LOGI(TAG, "  2. TX/RX pins are connected correctly");
     ESP_LOGI(TAG, "  3. WBR3 is powered (3.3V)");
     
@@ -372,28 +389,17 @@ extern "C" void app_main(void)
     int len;
     int total_received = 0;
     int loop_count = 0;
-    bool tried_115200 = false;
     
     // Главный цикл
     while (1) {
         loop_count++;
         
         // Периодически выводим статус
-        if (loop_count % 100 == 0) {
+        if (loop_count % 500 == 0) {
             size_t available = 0;
             uart_get_buffered_data_len(WBR3_UART_NUM, &available);
             ESP_LOGI(TAG, "Loop %d: total received=%d, buffer=%d bytes", 
                      loop_count, total_received, available);
-            
-            // Если долго нет данных, попробуем переключить скорость на 115200
-            if (total_received == 0 && loop_count == 300 && !tried_115200) {
-                ESP_LOGW(TAG, "No data received after 300 loops. Trying 115200 baud...");
-                uart_set_baudrate(WBR3_UART_NUM, 115200);
-                tried_115200 = true;
-                ESP_LOGI(TAG, "UART speed changed to 115200. Waiting for data...");
-                // Очищаем буферы
-                uart_flush(WBR3_UART_NUM);
-            }
         }
         
         // Чтение данных из UART - простая логика как в рабочей прошивке
@@ -465,6 +471,24 @@ extern "C" void app_main(void)
         // ВАЖНО: wifi_uart_service должен вызываться постоянно,
         // даже если данных нет (для обработки таймеров и отправки ответов)
         wifi_uart_service();
+        
+        // Периодически отправляем обновления DP значений (особенно для Battery Current)
+        // Это гарантирует, что значения обновляются даже если STATE_QUERY не приходит
+        if (loop_count % 1000 == 0) {
+            // Принудительно отправляем Battery Current для тестирования
+            // Умножаем на 1000, так как приложение делит на 1000
+            unsigned long current_value = battery_current * 1000;
+            float current_amps = battery_current / 1000.0f;
+            ESP_LOGI(TAG, "=== Periodic update: Battery Current = %lu mA (%.3f A) -> sending %lu ===", 
+                     battery_current, current_amps, current_value);
+            unsigned char ret = mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
+            ESP_LOGI(TAG, "=== Periodic update result: %d (1=SUCCESS) ===", ret);
+            
+            // Также отправляем все остальные DP для синхронизации
+            mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
+            mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
+            mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage / 100);
+        }
         
         // Периодически проверяем статус WiFi подключения
         if (loop_count % 500 == 0) {

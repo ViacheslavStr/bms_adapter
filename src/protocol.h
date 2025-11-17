@@ -280,8 +280,6 @@ BLE_test_result has an internal #err prompt that is removed when the function is
 //Battery Voltage (105) - Value, Range: 0-100, Scale: 1, Unit: V (значение * 10)
 #define DPID_BATTERY_VOLTAGE 105
 
-
-
 /**
  * @brief  Send data processing
  * @param[in] {value} Serial port receives byte data
