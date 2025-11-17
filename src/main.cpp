@@ -10,6 +10,7 @@
 extern "C" {
     #include "wifi.h"
     #include "mcu_api.h"
+    #include "jk_bms.h"
 }
 
 static const char *TAG = "WBR3_TEST";
@@ -101,10 +102,10 @@ void uart_transmit_output(unsigned char value)
 
 // Глобальные переменные для хранения текущих значений DP
 // В реальном проекте эти значения должны обновляться из ваших датчиков/устройства
-static unsigned long current_temperature = 42;      // Текущая температура (°C) - можно использовать rand() % 100 для случайного значения
+static unsigned long current_temperature = 1;      // Текущая температура (°C) - можно использовать rand() % 100 для случайного значения
 static unsigned char current_status = 0;             // Текущий статус (enum): 0=charging, 1=discharging, 2=fault, 3=idle
-static unsigned long current_soc = 85;               // Текущий заряд батареи (%)
-static unsigned long battery_current = -130000;  // Текущий ток батареи (мА) - тестовое значение для проверки
+static unsigned long current_soc = 22;               // Текущий заряд батареи (%)
+static long battery_current = 20;  // Текущий ток батареи (мА) - тестируем с 200000 мА (200 А) для проверки обновления
 static unsigned long battery_voltage = 3700; // Текущее напряжение батареи (мВ)
 
 // Функция обработки всех данных (нужна для SDK)
@@ -130,15 +131,21 @@ void all_data_update(void)
     }
     
     // DPID_BATTERY_CURRENT (102) - Battery Current
-    // Range: -200-200, Scale: 0, Unit: A
-    // ВАЖНО: Приложение делит отправляемое значение на 1000!
-    // Если отправляем 110000, приложение показывает 110 мА (110000 / 1000 = 110)
-    // Чтобы показать 110000 мА, нужно отправить 110000 * 1000 = 110000000
-    // Или чтобы показать 110 А, нужно отправить 110 * 1000 = 110000
-    unsigned long current_value = battery_current * 1000; // Умножаем на 1000, чтобы приложение показало правильное значение
-    float current_amps = battery_current / 1000.0f; // 110000 мА = 110 А
-    ESP_LOGI(TAG, "  → Sending DP 102 (Battery Current): %lu mA (%.3f A) -> sending %lu (mA * 1000)", 
-             battery_current, current_amps, current_value);
+    // Пробуем отправлять напрямую БЕЗ умножения на 1000
+    // Range: -200000-200000, Scale: 0, Unit: mA - отправляем миллиамперы напрямую
+    // Если приложение показывает 110 мА постоянно, возможно проблема в настройках DP в Tuya Developer Platform
+    long current_value_signed = battery_current; // Отправляем напрямую в мА
+    union {
+        long signed_val;
+        unsigned long unsigned_val;
+    } current_union;
+    current_union.signed_val = current_value_signed;
+    unsigned long current_value = current_union.unsigned_val;
+    float current_amps = battery_current / 1000.0f;
+    ESP_LOGI(TAG, "  → Sending DP 102 (Battery Current): %ld mA (%.3f A)", 
+             battery_current, current_amps);
+    ESP_LOGI(TAG, "     Sending directly: %lu (0x%08lX) - NO multiplication by 1000", 
+             current_value, current_value);
     ret = mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
     if (ret == SUCCESS) {
         ESP_LOGI(TAG, "  ✓ DP 102 sent successfully");
@@ -212,18 +219,25 @@ void update_status(unsigned char status)
     ESP_LOGI(TAG, "Status updated: %d", current_status);
 }
 
-void update_battery_data(unsigned long soc, unsigned long current, unsigned long voltage)
+void update_battery_data(unsigned long soc, long current, unsigned long voltage)
 {
     current_soc = soc;
     battery_current = current;
     battery_voltage = voltage;
     
     mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
-    // Отправляем Battery Current, умножая на 1000 (приложение делит на 1000)
-    mcu_dp_value_update(DPID_BATTERY_CURRENT, battery_current * 1000);
+    // Отправляем Battery Current напрямую в мА (Range: -200000-200000, Scale: 0, Unit: mA)
+    long current_value_signed = battery_current;
+    union {
+        long signed_val;
+        unsigned long unsigned_val;
+    } current_union;
+    current_union.signed_val = current_value_signed;
+    unsigned long current_value = current_union.unsigned_val;
+    mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
     mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage); // Scale: 1, вольты * 10
     
-    ESP_LOGI(TAG, "Battery data updated: SOC=%lu%%, I=%lu mA, U=%lu mV", 
+    ESP_LOGI(TAG, "Battery data updated: SOC=%lu%%, I=%ld mA, U=%lu mV", 
              current_soc, battery_current, battery_voltage);
 }
 
@@ -257,6 +271,16 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "WBR3 Test for ESP32-C3");
     ESP_LOGI(TAG, "========================================");
+    
+    // Инициализация JK BMS
+    ESP_LOGI(TAG, "Initializing JK BMS...");
+    if (jk_bms_init()) {
+        ESP_LOGI(TAG, "JK BMS initialized, connecting...");
+        // Подключаемся к BMS (можно сделать в отдельной задаче)
+        jk_bms_connect();
+    } else {
+        ESP_LOGE(TAG, "Failed to initialize JK BMS");
+    }
     
     // Настройка UART
     uart_config_t uart_config = {
@@ -472,14 +496,62 @@ extern "C" void app_main(void)
         // даже если данных нет (для обработки таймеров и отправки ответов)
         wifi_uart_service();
         
+        // Периодически обновляем данные от JK BMS
+        if (loop_count % 500 == 0) {
+            jk_bms_update();
+            
+            // Получаем данные от BMS и обновляем все значения
+            jk_bms_data_t bms_data;
+            if (jk_bms_get_data(&bms_data)) {
+                ESP_LOGI(TAG, "=== BMS Data: SOC=%d%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f°C ===",
+                         bms_data.soc, bms_data.voltage, bms_data.current, bms_data.temperature);
+                // Обновляем все значения из реальных данных BMS
+                current_soc = bms_data.soc;
+                battery_voltage = (unsigned long)(bms_data.voltage * 100);  // V * 100 -> mV
+                battery_current = (long)(bms_data.current * 1000);  // A -> mA
+                current_temperature = (unsigned long)bms_data.temperature;
+                
+                // Отправляем обновленные значения в Tuya
+                ESP_LOGI(TAG, "=== Updating Tuya with BMS data ===");
+                mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
+                mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage / 100);
+                
+                // Отправляем ток с правильной обработкой знака
+                long current_value_signed = battery_current;
+                union {
+                    long signed_val;
+                    unsigned long unsigned_val;
+                } current_union;
+                current_union.signed_val = current_value_signed;
+                unsigned long current_value = current_union.unsigned_val;
+                mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
+                
+                mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
+                ESP_LOGI(TAG, "=== Tuya values updated: SOC=%d%%, V=%lumV, I=%ldmA, T=%lu°C ===",
+                         current_soc, battery_voltage, battery_current, current_temperature);
+            } else {
+                jk_bms_status_t status = jk_bms_get_status();
+                if (status == JK_BMS_DISCONNECTED) {
+                    ESP_LOGW(TAG, "BMS disconnected, attempting to reconnect...");
+                    jk_bms_connect();
+                }
+            }
+        }
+        
         // Периодически отправляем обновления DP значений (особенно для Battery Current)
         // Это гарантирует, что значения обновляются даже если STATE_QUERY не приходит
         if (loop_count % 1000 == 0) {
             // Принудительно отправляем Battery Current для тестирования
-            // Умножаем на 1000, так как приложение делит на 1000
-            unsigned long current_value = battery_current * 1000;
+            // Отправляем напрямую в мА (Range: -200000-200000, Scale: 0, Unit: mA)
+            long current_value_signed = battery_current;
+            union {
+                long signed_val;
+                unsigned long unsigned_val;
+            } current_union;
+            current_union.signed_val = current_value_signed;
+            unsigned long current_value = current_union.unsigned_val;
             float current_amps = battery_current / 1000.0f;
-            ESP_LOGI(TAG, "=== Periodic update: Battery Current = %lu mA (%.3f A) -> sending %lu ===", 
+            ESP_LOGI(TAG, "=== Periodic update: Battery Current = %ld mA (%.3f A) -> sending %lu ===", 
                      battery_current, current_amps, current_value);
             unsigned char ret = mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
             ESP_LOGI(TAG, "=== Periodic update result: %d (1=SUCCESS) ===", ret);
