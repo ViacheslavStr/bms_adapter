@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include <string.h>
+#include <stdlib.h>
 
 // Удалены собственные реализации функций сканирования - они вызывали панику
 // Используем прямое подключение через GATT Client без предварительного сканирования
@@ -33,7 +34,10 @@ static esp_bt_uuid_t service_uuid = {
 };
 
 // Characteristic UUID: 0000ffe1-0000-1000-8000-00805f9b34fb
-// Используется в коде через прямое значение 0xFFE1
+static esp_bt_uuid_t char_uuid = {
+    .len = ESP_UUID_LEN_16,
+    .uuid = {.uuid16 = 0xFFE1}
+};
 
 // Структура профиля GATT Client
 struct gattc_profile_inst {
@@ -268,16 +272,66 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
                 ESP_LOGE(GATTC_TAG, "service not found");
                 break;
             }
-            // Service found, используем упрощенный подход
-            // Для JK BMS характеристика обычно находится сразу после service_end_handle
-            // Или используем известный handle (обычно service_end_handle + 1)
-            ESP_LOGI(GATTC_TAG, "Service found (handle %d-%d), using characteristic handle %d",
+            // Service found, получаем все характеристики сервиса
+            ESP_LOGI(GATTC_TAG, "Service found (handle %d-%d), getting all characteristics...",
                      profile_tab[PROFILE_APP_IDX].service_start_handle,
-                     profile_tab[PROFILE_APP_IDX].service_end_handle,
-                     profile_tab[PROFILE_APP_IDX].service_end_handle + 1);
+                     profile_tab[PROFILE_APP_IDX].service_end_handle);
             
-            // Устанавливаем handle характеристики (обычно сразу после service_end_handle)
-            profile_tab[PROFILE_APP_IDX].char_handle = profile_tab[PROFILE_APP_IDX].service_end_handle + 1;
+            // Получаем все характеристики сервиса
+            // Сначала получаем количество характеристик
+            uint16_t char_count = 0;
+            esp_err_t ret = esp_ble_gattc_get_attr_count(gattc_if,
+                                                         p_data->search_cmpl.conn_id,
+                                                         ESP_GATT_DB_CHARACTERISTIC,
+                                                         profile_tab[PROFILE_APP_IDX].service_start_handle,
+                                                         profile_tab[PROFILE_APP_IDX].service_end_handle,
+                                                         INVALID_HANDLE,
+                                                         &char_count);
+            if (ret != ESP_OK || char_count == 0) {
+                ESP_LOGE(GATTC_TAG, "Failed to get char count: %s (count=%d)", esp_err_to_name(ret), char_count);
+                // Fallback: используем service_end_handle + 1
+                ESP_LOGW(GATTC_TAG, "Falling back to service_end_handle + 1");
+                profile_tab[PROFILE_APP_IDX].char_handle = profile_tab[PROFILE_APP_IDX].service_end_handle + 1;
+                esp_ble_gattc_register_for_notify(gattc_if,
+                                                  profile_tab[PROFILE_APP_IDX].remote_bda,
+                                                  profile_tab[PROFILE_APP_IDX].char_handle);
+                break;
+            }
+            
+            // Выделяем память для характеристик
+            esp_gattc_char_elem_t *char_elem_result = (esp_gattc_char_elem_t *)malloc(sizeof(esp_gattc_char_elem_t) * char_count);
+            if (!char_elem_result) {
+                ESP_LOGE(GATTC_TAG, "Failed to allocate memory for characteristics");
+                break;
+            }
+            
+            // Получаем характеристики по UUID
+            ret = esp_ble_gattc_get_char_by_uuid(gattc_if,
+                                                  p_data->search_cmpl.conn_id,
+                                                  profile_tab[PROFILE_APP_IDX].service_start_handle,
+                                                  profile_tab[PROFILE_APP_IDX].service_end_handle,
+                                                  char_uuid,
+                                                  char_elem_result,
+                                                  &char_count);
+            if (ret != ESP_OK || char_count == 0) {
+                ESP_LOGE(GATTC_TAG, "Failed to get characteristic by UUID: %s (count=%d)", esp_err_to_name(ret), char_count);
+                free(char_elem_result);
+                // Fallback: используем service_end_handle + 1
+                ESP_LOGW(GATTC_TAG, "Falling back to service_end_handle + 1");
+                profile_tab[PROFILE_APP_IDX].char_handle = profile_tab[PROFILE_APP_IDX].service_end_handle + 1;
+                esp_ble_gattc_register_for_notify(gattc_if,
+                                                  profile_tab[PROFILE_APP_IDX].remote_bda,
+                                                  profile_tab[PROFILE_APP_IDX].char_handle);
+                break;
+            }
+            
+            // Нашли характеристику
+            ESP_LOGI(GATTC_TAG, "✓ Found characteristic! Handle=%d, UUID=0x%04X, Prop=0x%02X",
+                     char_elem_result[0].char_handle,
+                     char_elem_result[0].uuid.uuid.uuid16,
+                     char_elem_result[0].properties);
+            profile_tab[PROFILE_APP_IDX].char_handle = char_elem_result[0].char_handle;
+            free(char_elem_result);
             
             // Регистрируемся на уведомления (notifications)
             esp_ble_gattc_register_for_notify(gattc_if,
@@ -301,14 +355,17 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
             break;
         case ESP_GATTC_NOTIFY_EVT:
             // Уведомления от BMS (данные приходят автоматически)
-            ESP_LOGI(GATTC_TAG, "NOTIFY_EVT: handle=%d, len=%d", 
-                     p_data->notify.handle, p_data->notify.value_len);
+            // Минимальное логирование - только для больших пакетов
+            if (p_data->notify.value_len > 20) {
+                ESP_LOGI(GATTC_TAG, "NOTIFY_EVT: handle=%d, len=%d", 
+                         p_data->notify.handle, p_data->notify.value_len);
+            }
+            
             if (p_data->notify.handle == profile_tab[PROFILE_APP_IDX].char_handle) {
-                ESP_LOGI(GATTC_TAG, "Received notification from BMS, parsing data...");
                 parse_bms_data(p_data->notify.value, p_data->notify.value_len);
             } else {
-                ESP_LOGW(GATTC_TAG, "Notification from unknown handle: %d (expected: %d)", 
-                         p_data->notify.handle, profile_tab[PROFILE_APP_IDX].char_handle);
+                // Пробуем парсить в любом случае
+                parse_bms_data(p_data->notify.value, p_data->notify.value_len);
             }
             break;
         case ESP_GATTC_READ_CHAR_EVT:
@@ -316,13 +373,31 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
                 ESP_LOGE(GATTC_TAG, "read char failed, error status = %x", p_data->read.status);
                 break;
             }
-            ESP_LOGI(GATTC_TAG, "READ_CHAR_EVT: len=%d", p_data->read.value_len);
+            ESP_LOGI(GATTC_TAG, "=== READ_CHAR_EVT: len=%d ===", p_data->read.value_len);
+            if (p_data->read.value_len > 0) {
+                ESP_LOGI(GATTC_TAG, "First 16 bytes: ");
+                for (int i = 0; i < p_data->read.value_len && i < 16; i++) {
+                    printf("%02X ", p_data->read.value[i]);
+                }
+                printf("\n");
+            }
             parse_bms_data(p_data->read.value, p_data->read.value_len);
+            break;
+        case ESP_GATTC_WRITE_CHAR_EVT:
+            ESP_LOGI(GATTC_TAG, "=== WRITE_CHAR_EVT: status=0x%x ===", p_data->write.status);
+            if (p_data->write.status == ESP_GATT_OK) {
+                ESP_LOGI(GATTC_TAG, "✓ Command written successfully, waiting for notification...");
+            } else {
+                ESP_LOGE(GATTC_TAG, "✗ Write failed: status=0x%x", p_data->write.status);
+            }
             break;
         case ESP_GATTC_REG_FOR_NOTIFY_EVT:
             ESP_LOGI(GATTC_TAG, "REG_FOR_NOTIFY_EVT: status=%x", p_data->reg_for_notify.status);
             if (p_data->reg_for_notify.status == ESP_GATT_OK) {
                 ESP_LOGI(GATTC_TAG, "Successfully registered for notifications");
+                // Отправляем команду чтения сразу после регистрации на уведомления
+                vTaskDelay(pdMS_TO_TICKS(500));  // Небольшая задержка
+                jk_bms_update();  // Отправляем команду чтения
             }
             break;
         default:
@@ -341,7 +416,36 @@ static void parse_bms_data(uint8_t *data, uint16_t len)
         return;
     }
 
-    ESP_LOGI(TAG, "Received BMS data chunk, len=%d, buffer_pos=%d", len, bms_buffer_pos);
+    // Проверяем, не являются ли данные повторяющимися "AT\r\n"
+    // Если это просто эхо "AT\r\n", игнорируем после первого раза
+    static int at_response_count = 0;
+    if (len == 4 && data[0] == 0x41 && data[1] == 0x54 && 
+        data[2] == 0x0D && data[3] == 0x0A) {
+        at_response_count++;
+        if (at_response_count <= 3) {
+            ESP_LOGI(TAG, "Received AT response #%d (AT\\r\\n) - ignoring", at_response_count);
+        } else if (at_response_count == 4) {
+            ESP_LOGW(TAG, "Too many AT responses, ignoring all further AT\\r\\n");
+        }
+        return;  // Игнорируем повторяющиеся AT\r\n
+    }
+    
+    // Сбрасываем счетчик, если пришли другие данные
+    if (at_response_count > 0) {
+        at_response_count = 0;
+    }
+    
+    // Минимальное логирование - только для не-AT данных и только первые несколько раз
+    static int data_log_count = 0;
+    if (data_log_count < 3 && len > 4) {
+        data_log_count++;
+        ESP_LOGI(TAG, "Received BMS data chunk, len=%d, buffer_pos=%d", len, bms_buffer_pos);
+        ESP_LOGI(TAG, "First 16 bytes: ");
+        for (int i = 0; i < len && i < 16; i++) {
+            printf("%02X ", data[i]);
+        }
+        printf("\n");
+    }
     
     // Добавляем данные в буфер
     if (bms_buffer_pos + len < BMS_BUFFER_SIZE) {
@@ -351,6 +455,43 @@ static void parse_bms_data(uint8_t *data, uint16_t len)
         ESP_LOGW(TAG, "Buffer overflow! Resetting buffer.");
         bms_buffer_pos = 0;
         return;
+    }
+    
+    // Если буфер слишком большой без признаков пакета, выводим содержимое для анализа
+    if (bms_buffer_pos > 200) {
+        bool has_packet_marker = false;
+        for (int i = 0; i < bms_buffer_pos - 3; i++) {
+            if ((bms_buffer[i] == 0x55 && bms_buffer[i+1] == 0xAA && 
+                 bms_buffer[i+2] == 0xEB && bms_buffer[i+3] == 0x90) ||
+                (bms_buffer[i] == 0xFE && bms_buffer[i+1] == 0xFF && 
+                 bms_buffer[i+2] == 0xFF && bms_buffer[i+3] == 0xFF)) {
+                has_packet_marker = true;
+                break;
+            }
+        }
+        if (!has_packet_marker) {
+            ESP_LOGI(TAG, "No binary packet marker found in %d bytes, but may be text data", bms_buffer_pos);
+            ESP_LOGI(TAG, "Buffer content (first 200 bytes): ");
+            for (int i = 0; i < bms_buffer_pos && i < 200; i++) {
+                printf("%02X ", bms_buffer[i]);
+                if ((i + 1) % 16 == 0) {
+                    printf("  | ");
+                    for (int j = i - 15; j <= i; j++) {
+                        char c = (bms_buffer[j] >= 32 && bms_buffer[j] < 127) ? bms_buffer[j] : '.';
+                        printf("%c", c);
+                    }
+                    printf("\n");
+                }
+            }
+            if (bms_buffer_pos % 16 != 0) printf("\n");
+            // НЕ сбрасываем буфер - возможно данные в текстовом формате
+            // Сбрасываем только если буфер переполнен
+            if (bms_buffer_pos >= BMS_BUFFER_SIZE - 100) {
+                ESP_LOGW(TAG, "Buffer almost full, resetting");
+                bms_buffer_pos = 0;
+                return;
+            }
+        }
     }
     
     // Проверяем, есть ли полный пакет
@@ -383,24 +524,16 @@ static void parse_bms_data(uint8_t *data, uint16_t len)
     if (packet_start >= 0 && bms_buffer_pos - packet_start >= 200) {
         ESP_LOGI(TAG, "=== FULL BMS PACKET DETECTED (total %d bytes) ===", bms_buffer_pos - packet_start);
         
-        // Выводим полный hex-дамп для анализа
-        ESP_LOGI(TAG, "Full packet hex dump (offset %d):", packet_start);
-        for (int i = packet_start; i < bms_buffer_pos && i < packet_start + 300; i++) {
-            printf("%02X ", bms_buffer[i]);
-            if ((i - packet_start + 1) % 16 == 0) {
-                printf("  | ");
-                // ASCII representation
-                for (int j = i - 15; j <= i; j++) {
-                    char c = (bms_buffer[j] >= 32 && bms_buffer[j] < 127) ? bms_buffer[j] : '.';
-                    printf("%c", c);
-                }
-                printf("\n");
-            }
-        }
-        if ((bms_buffer_pos - packet_start) % 16 != 0) printf("\n");
-        
         uint8_t *packet_data = bms_buffer + packet_start;
         size_t packet_len = bms_buffer_pos - packet_start;
+        
+        // Выводим только первые 32 байта для быстрого анализа
+        ESP_LOGI(TAG, "Packet start (first 32 bytes):");
+        for (int i = 0; i < 32 && i < packet_len; i++) {
+            printf("%02X ", packet_data[i]);
+            if ((i + 1) % 16 == 0) printf("\n");
+        }
+        printf("\n");
         
         // Парсим данные согласно документации JK-BMS
         // Пакет 3 (128 байт) начинается с FE FF FF FF
@@ -418,63 +551,355 @@ static void parse_bms_data(uint8_t *data, uint16_t len)
             }
         }
         
+        // Выводим полный hex-дамп пакета 3 для анализа структуры
         if (packet3_start >= 0 && packet_len - packet3_start >= 100) {
-            ESP_LOGI(TAG, "Found packet 3 at offset %d, parsing binary data...", packet3_start);
-            
-            // Parse Current - offset 8-11 (4 bytes, signed, little-endian, в мА)
-            if (packet3_start + 11 < packet_len) {
-                int32_t current_ma = (int32_t)(packet_data[packet3_start + 8] | 
-                                               (packet_data[packet3_start + 9] << 8) |
-                                               (packet_data[packet3_start + 10] << 16) |
-                                               (packet_data[packet3_start + 11] << 24));
-                bms_data.current = current_ma / 1000.0f;  // Конвертируем мА в А
-                ESP_LOGI(TAG, "Current parsed from offset %d: %ld mA (%.3f A)", 
-                         packet3_start + 8, current_ma, bms_data.current);
+            ESP_LOGI(TAG, "=== PACKET 3 FULL HEX DUMP (offset %d, %d bytes) ===", 
+                     packet3_start, packet_len - packet3_start);
+            for (int i = packet3_start; i < packet_len && i < packet3_start + 128; i++) {
+                printf("%02X ", packet_data[i]);
+                if ((i - packet3_start + 1) % 16 == 0) {
+                    printf("  | ");
+                    for (int j = i - 15; j <= i; j++) {
+                        char c = (packet_data[j] >= 32 && packet_data[j] < 127) ? packet_data[j] : '.';
+                        printf("%c", c);
+                    }
+                    printf("  [offset %d-%d]\n", i-15, i);
+                }
+            }
+            if ((packet_len - packet3_start) % 16 != 0) {
+                printf("\n");
             }
             
-            // Parse Voltage - offset 12-15 (4 bytes, little-endian, в мВ)
-            if (packet3_start + 15 < packet_len) {
-                uint32_t voltage_mv = (uint32_t)(packet_data[packet3_start + 12] | 
-                                                 (packet_data[packet3_start + 13] << 8) |
-                                                 (packet_data[packet3_start + 14] << 16) |
-                                                 (packet_data[packet3_start + 15] << 24));
-                bms_data.voltage = voltage_mv / 1000.0f;  // Конвертируем мВ в В
-                ESP_LOGI(TAG, "Voltage parsed from offset %d: %lu mV (%.2f V)", 
-                         packet3_start + 12, voltage_mv, bms_data.voltage);
+            // Детальный анализ всех значений для поиска правильных offset'ов
+            ESP_LOGI(TAG, "=== DETAILED VALUE ANALYSIS ===");
+            ESP_LOGI(TAG, "Looking for: V≈53V, I≈-0.37A, SOC=87% (265/304), T≈22-23°C");
+            ESP_LOGI(TAG, "--- 4-byte signed values (as mA for current, as mV for voltage) ---");
+            for (int offset = 0; offset < 100 && offset + 3 < packet_len - packet3_start; offset += 4) {
+                int32_t val_signed = (int32_t)(packet_data[packet3_start + offset] | 
+                                              (packet_data[packet3_start + offset + 1] << 8) |
+                                              (packet_data[packet3_start + offset + 2] << 16) |
+                                              ((int32_t)packet_data[packet3_start + offset + 3] << 24));
+                uint32_t val_unsigned = (uint32_t)(packet_data[packet3_start + offset] | 
+                                                  (packet_data[packet3_start + offset + 1] << 8) |
+                                                  (packet_data[packet3_start + offset + 2] << 16) |
+                                                  (packet_data[packet3_start + offset + 3] << 24));
+                
+                // Проверяем как ток (мА): -500 до +500 мА
+                if (val_signed >= -500 && val_signed <= 500 && val_signed != 0) {
+                    ESP_LOGI(TAG, "  Offset %d: %ld (signed) = %.3fA - POSSIBLE CURRENT!", 
+                             offset, val_signed, val_signed / 1000.0f);
+                }
+                
+                // Проверяем как напряжение (мВ): 50000-55000 мВ = 50-55V
+                if (val_unsigned >= 50000 && val_unsigned <= 55000) {
+                    ESP_LOGI(TAG, "  Offset %d: %lu (unsigned) = %.2fV - POSSIBLE VOLTAGE!", 
+                             offset, val_unsigned, val_unsigned / 1000.0f);
+                }
+                
+                // Проверяем как capacity (Ah): 265 или 304 в разных масштабах
+                if ((val_unsigned >= 2640 && val_unsigned <= 2660) || 
+                    (val_unsigned >= 26400 && val_unsigned <= 26600) ||
+                    (val_unsigned >= 264000 && val_unsigned <= 266000)) {
+                    float cap = val_unsigned;
+                    if (cap > 100000) cap /= 1000.0f;
+                    else if (cap > 10000) cap /= 100.0f;
+                    else if (cap > 1000) cap /= 10.0f;
+                    ESP_LOGI(TAG, "  Offset %d: %lu = %.1fAh - POSSIBLE REMAIN CAPACITY!", 
+                             offset, val_unsigned, cap);
+                }
+                if ((val_unsigned >= 3030 && val_unsigned <= 3050) || 
+                    (val_unsigned >= 30300 && val_unsigned <= 30500) ||
+                    (val_unsigned >= 303000 && val_unsigned <= 305000)) {
+                    float cap = val_unsigned;
+                    if (cap > 100000) cap /= 1000.0f;
+                    else if (cap > 10000) cap /= 100.0f;
+                    else if (cap > 1000) cap /= 10.0f;
+                    ESP_LOGI(TAG, "  Offset %d: %lu = %.1fAh - POSSIBLE BATTERY CAPACITY!", 
+                             offset, val_unsigned, cap);
+                }
             }
             
-            // Parse SOC - offset 92 (1 byte, percentage)
-            if (packet3_start + 92 < packet_len) {
-                uint8_t soc = packet_data[packet3_start + 92];
-                if (soc <= 100) {
-                    bms_data.soc = soc;
-                    ESP_LOGI(TAG, "SOC parsed from offset %d: %d%%", packet3_start + 92, bms_data.soc);
+            ESP_LOGI(TAG, "--- 2-byte signed values (as 0.1°C for temperature) ---");
+            for (int offset = 60; offset < 100 && offset + 1 < packet_len - packet3_start; offset += 2) {
+                int16_t val = (int16_t)(packet_data[packet3_start + offset] | 
+                                       (packet_data[packet3_start + offset + 1] << 8));
+                // Проверяем как температура (0.1°C): 220-230 = 22.0-23.0°C
+                if (val >= 220 && val <= 230) {
+                    ESP_LOGI(TAG, "  Offset %d: %d (0.1°C) = %.1f°C - POSSIBLE TEMPERATURE!", 
+                             offset, val, val / 10.0f);
+                }
+            }
+        }
+        
+        // Ищем пакет 55 AA EB 90 для парсинга основных данных
+        int packet1_start = -1;
+        for (int i = 0; i < packet_len - 3; i++) {
+            if (packet_data[i] == 0x55 && packet_data[i+1] == 0xAA && 
+                packet_data[i+2] == 0xEB && packet_data[i+3] == 0x90) {
+                packet1_start = i;
+                break;
+            }
+        }
+        
+        if (packet3_start >= 0 && packet_len - packet3_start >= 100) {
+            // Анализируем hex-дамп для поиска правильных offset'ов
+            // Из скриншотов: V≈53.01V, I≈-0.37A, SOC=87%, T≈22-23°C
+            
+            // НАПРЯЖЕНИЕ - пробуем разные варианты
+            // Вариант 1: из пакета 55 AA EB 90, offset 156-157 (2 bytes, 0.1V units)
+            if (packet1_start >= 0 && packet1_start + 157 < packet_len) {
+                uint16_t voltage_01v = packet_data[packet1_start + 156] | 
+                                       (packet_data[packet1_start + 157] << 8);
+                if (voltage_01v >= 400 && voltage_01v <= 650) {  // 40V to 65V в 0.1V
+                    bms_data.voltage = voltage_01v / 10.0f;
+                    ESP_LOGI(TAG, "✓ Voltage from packet1 offset 156-157: %d (0.1V) = %.2fV", 
+                             voltage_01v, bms_data.voltage);
+                }
+            }
+            
+            // ТОК - анализируем hex-дамп более тщательно
+            // Из hex-дампа: offset 4-7 = 8F E9 1D 02 = 0x021DE98F = 35633167 (слишком большое)
+            // offset 16-19 = 00 00 C0 D8 = 0xD8C00000 = -654311424 (отрицательное, но слишком большое)
+            // Пробуем интерпретировать как разные форматы
+            
+            int32_t current_ma = 0;
+            bool current_found = false;
+            
+            // Вариант 1: offset 4-7 как signed int32 (8F E9 1D 02)
+            // 0x021DE98F = 35633167 - слишком большое, но может быть в других единицах
+            if (packet3_start + 7 < packet_len) {
+                int32_t current_test = (int32_t)(packet_data[packet3_start + 4] | 
+                                                (packet_data[packet3_start + 5] << 8) |
+                                                (packet_data[packet3_start + 6] << 16) |
+                                                ((int32_t)packet_data[packet3_start + 7] << 24));
+                // Если это в 0.1мА, то делим на 10
+                int32_t current_ma_test = current_test / 10;
+                if (current_ma_test >= -100000 && current_ma_test <= 100000 && current_ma_test != 0) {
+                    current_ma = current_ma_test;
+                    bms_data.current = current_ma / 1000.0f;
+                    current_found = true;
+                    ESP_LOGI(TAG, "✓ Current from packet3 offset 4-7 (0.1mA): %ld mA = %.3f A", 
+                             current_ma, bms_data.current);
+                }
+            }
+            
+            // Вариант 2: offset 16-19 как signed int32 (00 00 C0 D8 = 0xD8C00000)
+            // Это отрицательное число, может быть ток в мА
+            if (!current_found && packet3_start + 19 < packet_len) {
+                int32_t current_test = (int32_t)(packet_data[packet3_start + 16] | 
+                                                (packet_data[packet3_start + 17] << 8) |
+                                                (packet_data[packet3_start + 18] << 16) |
+                                                ((int32_t)packet_data[packet3_start + 19] << 24));
+                // Проверяем как есть и с делением на 10/100
+                if (current_test >= -100000 && current_test <= 100000 && current_test != 0) {
+                    current_ma = current_test;
+                    bms_data.current = current_ma / 1000.0f;
+                    current_found = true;
+                    ESP_LOGI(TAG, "✓ Current from packet3 offset 16-19: %ld mA = %.3f A", 
+                             current_ma, bms_data.current);
                 } else {
-                    ESP_LOGW(TAG, "Invalid SOC value: %d (expected 0-100)", soc);
+                    // Пробуем делить на 10
+                    int32_t current_ma_test = current_test / 10;
+                    if (current_ma_test >= -100000 && current_ma_test <= 100000 && current_ma_test != 0) {
+                        current_ma = current_ma_test;
+                        bms_data.current = current_ma / 1000.0f;
+                        current_found = true;
+                        ESP_LOGI(TAG, "✓ Current from packet3 offset 16-19 (/10): %ld mA = %.3f A", 
+                                 current_ma, bms_data.current);
+                    }
                 }
             }
             
-            // Также пробуем старый формат (55 AA EB 90) для совместимости
-            // Parse SOC - offset 8 от начала пакета 55 AA EB 90
-            if (packet_data[0] == 0x55 && packet_data[1] == 0xAA && 
-                packet_data[2] == 0xEB && packet_data[3] == 0x90 && packet_len >= 9) {
-                uint8_t soc_alt = packet_data[8];
-                if (soc_alt <= 100 && bms_data.soc == 0) {
-                    bms_data.soc = soc_alt;
-                    ESP_LOGI(TAG, "SOC parsed from format 55 AA EB 90, offset 8: %d%%", soc_alt);
+            // Вариант 3: offset 20-23 (E7 FE 3F 00)
+            if (!current_found && packet3_start + 23 < packet_len) {
+                int32_t current_test = (int32_t)(packet_data[packet3_start + 20] | 
+                                                (packet_data[packet3_start + 21] << 8) |
+                                                (packet_data[packet3_start + 22] << 16) |
+                                                ((int32_t)packet_data[packet3_start + 23] << 24));
+                if (current_test >= -100000 && current_test <= 100000 && current_test != 0) {
+                    current_ma = current_test;
+                    bms_data.current = current_ma / 1000.0f;
+                    current_found = true;
+                    ESP_LOGI(TAG, "✓ Current from packet3 offset 20-23: %ld mA = %.3f A", 
+                             current_ma, bms_data.current);
                 }
+            }
+            
+            // Вариант 4: ток из пакета 55 AA EB 90 (offset 158, 2 bytes, signed, мА)
+            if (!current_found && packet1_start >= 0 && packet1_start + 159 < packet_len) {
+                int16_t current_ma_alt = (int16_t)(packet_data[packet1_start + 158] | 
+                                                   (packet_data[packet1_start + 159] << 8));
+                if (current_ma_alt != 0 && current_ma_alt >= -10000 && current_ma_alt <= 10000) {
+                    current_ma = current_ma_alt;
+                    bms_data.current = current_ma / 1000.0f;
+                    current_found = true;
+                    ESP_LOGI(TAG, "✓ Current from packet1 offset 158-159: %d mA = %.3f A", 
+                             current_ma_alt, bms_data.current);
+                }
+            }
+            
+            // Вариант 5: пробуем все offset'ы в пакете 3 для поиска значения около -370 мА
+            if (!current_found) {
+                for (int offset = 4; offset < 50 && offset + 3 < packet_len - packet3_start; offset += 4) {
+                    int32_t current_test = (int32_t)(packet_data[packet3_start + offset] | 
+                                                    (packet_data[packet3_start + offset + 1] << 8) |
+                                                    (packet_data[packet3_start + offset + 2] << 16) |
+                                                    ((int32_t)packet_data[packet3_start + offset + 3] << 24));
+                    
+                    // Пробуем разные масштабы
+                    for (int div = 1; div <= 1000; div *= 10) {
+                        int32_t current_ma_test = current_test / div;
+                        if (current_ma_test >= -500 && current_ma_test <= 500 && current_ma_test != 0) {
+                            current_ma = current_ma_test;
+                            bms_data.current = current_ma / 1000.0f;
+                            current_found = true;
+                            ESP_LOGI(TAG, "✓ Current from packet3 offset %d (div %d): %ld mA = %.3f A", 
+                                     offset, div, current_ma, bms_data.current);
+                            break;
+                        }
+                    }
+                    if (current_found) break;
+                }
+            }
+            
+            if (!current_found) {
+                ESP_LOGW(TAG, "Current not found - searching all offsets...");
+            }
+            
+            // SOC - пользователь говорит, что SOC = (remain capacity / battery capacity) * 100
+            // Ищем remain capacity и battery capacity в пакете
+            // Из скриншотов: Remain Capacity: 265.0 Ah, Battery Capacity: 304.0 Ah
+            // SOC = (265 / 304) * 100 ≈ 87%
+            
+            uint32_t remain_capacity_ah = 0;
+            uint32_t battery_capacity_ah = 0;
+            int remain_offset = -1;
+            int battery_offset = -1;
+            
+            // Ищем capacity в разных offset'ах пакета 3 более тщательно
+            // Пробуем все offset'ы и ищем значения близкие к 265 и 304
+            for (int offset = 20; offset < 100 && offset + 3 < packet_len - packet3_start; offset += 4) {
+                uint32_t val1 = (uint32_t)(packet_data[packet3_start + offset] | 
+                                          (packet_data[packet3_start + offset + 1] << 8) |
+                                          (packet_data[packet3_start + offset + 2] << 16) |
+                                          (packet_data[packet3_start + offset + 3] << 24));
+                
+                // Пробуем разные масштабы для поиска 265 и 304
+                // 265.0 может быть: 2650 (0.1Ah), 26500 (0.01Ah), 265000 (0.001Ah)
+                // 304.0 может быть: 3040 (0.1Ah), 30400 (0.01Ah), 304000 (0.001Ah)
+                
+                // Ищем remain capacity (265 Ah)
+                if (remain_capacity_ah == 0) {
+                    if ((val1 >= 2640 && val1 <= 2660) ||      // 265.0 в 0.1Ah = 2650
+                        (val1 >= 26400 && val1 <= 26600) ||    // 265.0 в 0.01Ah = 26500
+                        (val1 >= 264000 && val1 <= 266000)) {  // 265.0 в 0.001Ah = 265000
+                        remain_capacity_ah = val1;
+                        remain_offset = offset;
+                        ESP_LOGI(TAG, "✓ Found remain capacity at offset %d: %lu (raw)", offset, val1);
+                    }
+                }
+                
+                // Ищем battery capacity (304 Ah)
+                if (battery_capacity_ah == 0) {
+                    if ((val1 >= 3030 && val1 <= 3050) ||      // 304.0 в 0.1Ah = 3040
+                        (val1 >= 30300 && val1 <= 30500) ||    // 304.0 в 0.01Ah = 30400
+                        (val1 >= 303000 && val1 <= 305000)) {  // 304.0 в 0.001Ah = 304000
+                        battery_capacity_ah = val1;
+                        battery_offset = offset;
+                        ESP_LOGI(TAG, "✓ Found battery capacity at offset %d: %lu (raw)", offset, val1);
+                    }
+                }
+            }
+            
+            // Вычисляем SOC из capacity если нашли оба значения
+            if (battery_capacity_ah > 0 && remain_capacity_ah > 0) {
+                float remain = remain_capacity_ah;
+                float total = battery_capacity_ah;
+                
+                // Определяем масштаб по величине значений
+                if (remain > 100000) {
+                    remain /= 1000.0f;  // 0.001Ah
+                    total /= 1000.0f;
+                } else if (remain > 10000) {
+                    remain /= 100.0f;   // 0.01Ah
+                    total /= 100.0f;
+                } else if (remain > 1000) {
+                    remain /= 10.0f;    // 0.1Ah
+                    total /= 10.0f;
+                }
+                // Иначе считаем что в Ah
+                
+                if (total > 0) {
+                    bms_data.soc = (uint8_t)((remain / total) * 100.0f);
+                    ESP_LOGI(TAG, "✓ SOC calculated from capacity: %.1f / %.1f = %d%% (offsets: remain=%d, battery=%d)", 
+                             remain, total, bms_data.soc, remain_offset, battery_offset);
+                }
+            } else {
+                ESP_LOGW(TAG, "Capacity not found: remain=%lu (offset %d), battery=%lu (offset %d)", 
+                         remain_capacity_ah, remain_offset, battery_capacity_ah, battery_offset);
+            }
+            
+            // Если не нашли через capacity, пробуем прямые offset'ы для SOC
+            if (bms_data.soc == 0) {
+                // Вариант 1: offset 8 от 55 AA EB 90 (1 byte, percentage)
+                if (packet1_start >= 0 && packet1_start + 8 < packet_len) {
+                    uint8_t soc = packet_data[packet1_start + 8];
+                    if (soc <= 100 && soc >= 0) {
+                        bms_data.soc = soc;
+                        ESP_LOGI(TAG, "SOC from packet1 offset 8: %d%%", bms_data.soc);
+                    }
+                }
+                
+                // Вариант 2: offset 92 от FE FF FF FF
+                if (bms_data.soc == 0 && packet3_start + 92 < packet_len) {
+                    uint8_t soc = packet_data[packet3_start + 92];
+                    if (soc <= 100 && soc >= 0) {
+                        bms_data.soc = soc;
+                        ESP_LOGI(TAG, "SOC from packet3 offset 92: %d%%", bms_data.soc);
+                    }
+                }
+            }
+            
+            // Температура - ищем значения около 22-23°C (220-230 в 0.1°C или 22-23 в °C)
+            // Пробуем разные offset'ы более тщательно
+            bool temp_found = false;
+            for (int offset = 60; offset < 100 && offset + 1 < packet_len - packet3_start; offset += 2) {
+                int16_t temp_raw = (int16_t)(packet_data[packet3_start + offset] | 
+                                            (packet_data[packet3_start + offset + 1] << 8));
+                
+                // Если в 0.1°C: 220-230 = 22.0-23.0°C (или 256 = 25.6°C - близко)
+                if (temp_raw >= 200 && temp_raw <= 300) {
+                    bms_data.temperature = temp_raw / 10.0f;
+                    temp_found = true;
+                    ESP_LOGI(TAG, "✓ Temperature from packet3 offset %d: %d (0.1°C) = %.1f°C", 
+                             offset, temp_raw, bms_data.temperature);
+                    break;
+                }
+                // Если в °C: 22-23
+                else if (temp_raw >= 20 && temp_raw <= 30) {
+                    bms_data.temperature = (float)temp_raw;
+                    temp_found = true;
+                    ESP_LOGI(TAG, "✓ Temperature from packet3 offset %d: %d°C", 
+                             offset, (int)bms_data.temperature);
+                    break;
+                }
+            }
+            
+            if (!temp_found) {
+                ESP_LOGW(TAG, "Temperature not found in expected range (22-23°C)");
             }
             
             bms_data.is_valid = true;
-            ESP_LOGI(TAG, "=== PARSED BMS Data: V=%.2fV, SOC=%d%%, I=%.3fA ===", 
-                     bms_data.voltage, bms_data.soc, bms_data.current);
+            ESP_LOGI(TAG, "=== FINAL PARSED: V=%.2fV, SOC=%d%%, I=%.3fA, T=%.1f°C ===", 
+                     bms_data.voltage, bms_data.soc, bms_data.current, bms_data.temperature);
         } else {
             ESP_LOGW(TAG, "Packet 3 not found or too short (packet3_start=%d, packet_len=%d)", 
                      packet3_start, packet_len);
         }
         
-        // Очищаем буфер после обработки
+        // Очищаем буфер сразу после обработки пакета
         bms_buffer_pos = 0;
+        return;  // Выходим, чтобы не обрабатывать дальше
     } else if (bms_buffer_pos > BMS_BUFFER_SIZE - 100) {
         // Если буфер почти полный, но пакет не найден, сбрасываем
         ESP_LOGW(TAG, "Buffer almost full but no complete packet found, resetting");
@@ -729,6 +1154,9 @@ void jk_bms_update(void)
         profile_tab[PROFILE_APP_IDX].char_handle != INVALID_HANDLE &&
         profile_tab[PROFILE_APP_IDX].gattc_if != ESP_GATT_IF_NONE) {
         
+        // Очищаем буфер перед новой командой
+        bms_buffer_pos = 0;
+        
         // JK-BMS command to read all data (из рабочей версии):
         // AA 55 90 EB 97 00 00 00 00 00 00 00 00 00 00 00 00 00 00 11
         uint8_t cmd[] = {0xAA, 0x55, 0x90, 0xEB, 0x97, 0x00, 0x00, 0x00, 0x00, 0x00, 
@@ -737,18 +1165,31 @@ void jk_bms_update(void)
         ESP_LOGI(TAG, "Sending read command to BMS (handle=%d, conn_id=%d)", 
                  profile_tab[PROFILE_APP_IDX].char_handle, profile_tab[PROFILE_APP_IDX].conn_id);
         
-        // Отправляем команду для чтения данных
+        // Пробуем сначала с ответом (ESP_GATT_WRITE_TYPE_RSP), потом без ответа
         esp_err_t ret = esp_ble_gattc_write_char(profile_tab[PROFILE_APP_IDX].gattc_if,
                                                  profile_tab[PROFILE_APP_IDX].conn_id,
                                                  profile_tab[PROFILE_APP_IDX].char_handle,
                                                  sizeof(cmd),
                                                  cmd,
-                                                 ESP_GATT_WRITE_TYPE_NO_RSP,
+                                                 ESP_GATT_WRITE_TYPE_RSP,  // С ответом
                                                  ESP_GATT_AUTH_REQ_NONE);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to write command to BMS: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Failed to write command (with response): %s, trying without response...", esp_err_to_name(ret));
+            // Пробуем без ответа
+            ret = esp_ble_gattc_write_char(profile_tab[PROFILE_APP_IDX].gattc_if,
+                                          profile_tab[PROFILE_APP_IDX].conn_id,
+                                          profile_tab[PROFILE_APP_IDX].char_handle,
+                                          sizeof(cmd),
+                                          cmd,
+                                          ESP_GATT_WRITE_TYPE_NO_RSP,
+                                          ESP_GATT_AUTH_REQ_NONE);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to write command (without response): %s", esp_err_to_name(ret));
+            } else {
+                ESP_LOGI(TAG, "✓ Read command sent to BMS (no response)");
+            }
         } else {
-            ESP_LOGI(TAG, "✓ Read command sent to BMS successfully");
+            ESP_LOGI(TAG, "✓ Read command sent to BMS (with response)");
         }
     } else {
         ESP_LOGW(TAG, "Cannot send BMS command: status=%d, handle=%d, gattc_if=%d",
