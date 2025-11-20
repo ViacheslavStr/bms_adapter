@@ -392,10 +392,8 @@ static void gattc_profile_event_handler(esp_gattc_cb_event_t event,
   case ESP_GATTC_NOTIFY_EVT:
     // Уведомления от BMS (данные приходят автоматически)
     // Минимальное логирование - только для больших пакетов
-    if (p_data->notify.value_len > 20) {
-      ESP_LOGI(GATTC_TAG, "NOTIFY_EVT: handle=%d, len=%d",
-               p_data->notify.handle, p_data->notify.value_len);
-    }
+    // Уведомления от BMS (данные приходят автоматически)
+    // Логирование убрано для предотвращения WDT
 
     if (p_data->notify.handle == profile_tab[PROFILE_APP_IDX].char_handle) {
       parse_bms_data(p_data->notify.value, p_data->notify.value_len);
@@ -506,17 +504,7 @@ static void parse_bms_data(uint8_t *data, uint16_t len) {
 
   // Минимальное логирование - только для не-AT данных и только первые несколько
   // раз
-  static int data_log_count = 0;
-  if (data_log_count < 3 && len > 4) {
-    data_log_count++;
-    ESP_LOGI(TAG, "Received BMS data chunk, len=%d, buffer_pos=%d", len,
-             bms_buffer_pos);
-    ESP_LOGI(TAG, "First 16 bytes: ");
-    for (int i = 0; i < len && i < 16; i++) {
-      printf("%02X ", data[i]);
-    }
-    printf("\n");
-  }
+  // Логирование чанков убрано для предотвращения WDT
 
   // Согласно esphome-jk-bms: собираем пакеты правильно
   // 1. Если в буфере видим 55 AA EB 90 - очищаем буфер (новый пакет)
@@ -577,37 +565,7 @@ static void parse_bms_data(uint8_t *data, uint16_t len) {
     uint8_t frame_type = (bms_buffer_pos > 4) ? bms_buffer[4] : 0;
 
     // Логируем пакет для отладки (только для пакета 0x02, и только первый раз)
-    static bool first_packet_logged = false;
-    if (frame_type == 0x02 && !first_packet_logged) {
-      ESP_LOGI(TAG,
-               "=== Packet 0x02 received, size=%d bytes ===", bms_buffer_pos);
-
-      // Выводим весь пакет (первые 300 байт для анализа)
-      int dump_size = (bms_buffer_pos < 300) ? bms_buffer_pos : 300;
-      ESP_LOGI(TAG, "Full packet dump (first %d bytes):", dump_size);
-      for (int i = 0; i < dump_size; i++) {
-        printf("%02X ", bms_buffer[i]);
-        if ((i + 1) % 16 == 0)
-          printf("\n");
-      }
-      if (dump_size % 16 != 0)
-        printf("\n");
-
-      // Логируем байты вокруг разных offset'ов для поиска данных
-      if (bms_buffer_pos >= 142) {
-        ESP_LOGI(TAG, "=== Checking various offsets ===");
-        ESP_LOGI(TAG, "Offset 118-121 (voltage JK02): %02X %02X %02X %02X",
-                 bms_buffer[118], bms_buffer[119], bms_buffer[120],
-                 bms_buffer[121]);
-        ESP_LOGI(TAG, "Offset 126-129 (current JK02): %02X %02X %02X %02X",
-                 bms_buffer[126], bms_buffer[127], bms_buffer[128],
-                 bms_buffer[129]);
-        ESP_LOGI(TAG, "Offset 130-131 (temp JK02): %02X %02X", bms_buffer[130],
-                 bms_buffer[131]);
-        ESP_LOGI(TAG, "Offset 141 (SOC JK02): %02X", bms_buffer[141]);
-      }
-      first_packet_logged = true;
-    }
+    // Логирование полного пакета убрано для предотвращения WDT
 
     if (frame_type == 0x02 && bms_buffer_pos >= 200) {
 // Пакет типа 0x02 (cell info) - основные данные
@@ -637,10 +595,9 @@ static void parse_bms_data(uint8_t *data, uint16_t len) {
       float v32 = v32_raw * 0.001f;
       uint8_t soc32 = bms_buffer[141 + 32];
 
-      ESP_LOGI(TAG,
-               "Offset detection: V0=%.2fV SOC0=%d%% | V16=%.2fV SOC16=%d%% | "
-               "V32=%.2fV SOC32=%d%%",
-               v0, soc0, v16, soc16, v32, soc32);
+      // ESP_LOGI(TAG, "Offset detection: V0=%.2fV SOC0=%d%% | V16=%.2fV
+      // SOC16=%d%% | V32=%.2fV SOC32=%d%%",
+      //          v0, soc0, v16, soc16, v32, soc32);
 
       // Эвристика: Напряжение должно быть разумным (10-150В) и SOC <= 100
       bool v0_valid = (v0 > 10.0f && v0 < 150.0f);
@@ -654,17 +611,16 @@ static void parse_bms_data(uint8_t *data, uint16_t len) {
 
       if (v32_valid && soc32_valid) {
         offset = 32;
-        ESP_LOGI(TAG, "Detected JK_PB2A16S15P protocol (offset 32)");
+        // ESP_LOGI(TAG, "Detected JK_PB2A16S15P protocol (offset 32)");
       } else if (v16_valid && soc16_valid) {
         offset = 16;
-        ESP_LOGI(TAG, "Detected JK02_32S protocol (offset 16)");
+        // ESP_LOGI(TAG, "Detected JK02_32S protocol (offset 16)");
       } else if (v0_valid && soc0_valid) {
         offset = 0;
-        ESP_LOGI(TAG, "Detected JK02_24S protocol (offset 0)");
+        // ESP_LOGI(TAG, "Detected JK02_24S protocol (offset 0)");
       } else {
-        ESP_LOGW(TAG, "Could not detect protocol version reliably, defaulting "
-                      "to offset 32 (most likely for PB model)");
-        // Если ничего не подошло, но модель PB, пробуем 32
+        // ESP_LOGW(TAG, "Could not detect protocol version reliably, defaulting
+        // to offset 32");
         offset = 32;
       }
 
@@ -677,25 +633,12 @@ static void parse_bms_data(uint8_t *data, uint16_t len) {
       bms_data.current = current_raw * 0.001f;
 
       // Temperature 1 (offset 130 + offset, 2 bytes, signed, 0.1°C)
-      // Для temperature offset умножается на 2 в esphome, но для PB модели
-      // (offset 32) проверим логику: 130 + 32 = 162. В дампе там E1 00 (22.5C).
-      // Если использовать offset*2 = 64, то 130+64 = 194.
-      // Давайте пока использовать простое смещение, так как оно сработало для
-      // 162. Если offset=16, то 130+16=146. В esphome 130+32=162. Видимо для PB
-      // модели offset просто добавляется.
-
       int16_t temp1_raw;
       if (offset == 16) {
-        // Для JK02_32S (offset 16) esphome делает offset*2 для температуры?
-        // В коде esphome: jk_get_16bit(130 + offset * 2)
-        // 130 + 32 = 162.
         temp1_raw = (int16_t)JK_GET_16BIT(130 + offset * 2);
       } else {
-        // Для offset 32 (PB) и offset 0
-        // 130 + 32 = 162. Это совпадает с дампом.
         temp1_raw = (int16_t)JK_GET_16BIT(130 + offset);
       }
-
       bms_data.temperature = temp1_raw * 0.1f;
 
       // SOC (offset 141 + offset, 1 byte, 0-100%)
