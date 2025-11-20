@@ -121,14 +121,14 @@ void uart_transmit_output(unsigned char value) {
 // В реальном проекте эти значения должны обновляться из ваших
 // датчиков/устройства
 static unsigned long current_temperature =
-    1; // Текущая температура (°C) - можно использовать rand() % 100 для
+    0; // Текущая температура (°C) - можно использовать rand() % 100 для
        // случайного значения
 static unsigned char current_status =
     0; // Текущий статус (enum): 0=charging, 1=discharging, 2=fault, 3=idle
-static unsigned long current_soc = 22; // Текущий заряд батареи (%)
-static long battery_current = 20;      // Текущий ток батареи (мА) - тестируем с
-                                  // 200000 мА (200 А) для проверки обновления
-static unsigned long battery_voltage = 3700; // Текущее напряжение батареи (мВ)
+static unsigned long current_soc = 0; // Текущий заряд батареи (%)
+static long battery_current = 0;      // Текущий ток батареи (мА) - тестируем с
+                                 // 200000 мА (200 А) для проверки обновления
+static unsigned long battery_voltage = 0; // Текущее напряжение батареи (мВ)
 
 // Функция обработки всех данных (нужна для SDK)
 // Вызывается при STATE_QUERY_CMD (0x08) - WBR3 запрашивает все DP состояния
