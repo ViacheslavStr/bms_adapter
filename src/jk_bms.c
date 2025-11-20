@@ -489,7 +489,7 @@ static void parse_bms_data(uint8_t *data, uint16_t len) {
       data[3] == 0x0A) {
     at_response_count++;
     if (at_response_count <= 3) {
-      ESP_LOGI(TAG, "Received AT response #%d (AT\\r\\n) - ignoring",
+      ESP_LOGD(TAG, "Received AT response #%d (AT\\r\\n) - ignoring",
                at_response_count);
     } else if (at_response_count == 4) {
       ESP_LOGW(TAG, "Too many AT responses, ignoring all further AT\\r\\n");
@@ -644,7 +644,7 @@ static void parse_bms_data(uint8_t *data, uint16_t len) {
       // SOC (offset 141 + offset, 1 byte, 0-100%)
       bms_data.soc = bms_buffer[141 + offset];
 
-      ESP_LOGI(TAG,
+      ESP_LOGD(TAG,
                "✓ Parsed packet 0x02 (offset=%d): V=%.2fV, I=%.3fA, SOC=%d%%, "
                "T=%.1f°C",
                offset, bms_data.voltage, bms_data.current, bms_data.soc,
@@ -909,6 +909,8 @@ bool jk_bms_get_data(jk_bms_data_t *data) {
   }
 
   memcpy(data, &bms_data, sizeof(jk_bms_data_t));
+  bms_data.is_valid = false; // Сбрасываем флаг, чтобы в следующий раз получить
+                             // только свежие данные
   return true;
 }
 

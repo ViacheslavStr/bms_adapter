@@ -1,16 +1,17 @@
-#include <stdio.h>
-#include <stdlib.h>
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-#include "driver/uart.h"
-#include "driver/gpio.h"
+#include <stdio.h>
+#include <stdlib.h>
 
 // Включаем заголовки SDK в блоке extern "C"
 extern "C" {
-    #include "wifi.h"
-    #include "mcu_api.h"
-    #include "jk_bms.h"
+#include "jk_bms.h"
+#include "mcu_api.h"
+#include "wifi.h"
 }
 
 static const char *TAG = "WBR3_TEST";
@@ -21,16 +22,20 @@ static const char *TAG = "WBR3_TEST";
 // ESP32 GPIO → WBR3 TXD (передача WBR3)
 // ESP32 GND → WBR3 GND
 // ESP32 3.3V → WBR3 VCC
-#define WBR3_UART_NUM        UART_NUM_0
-#define WBR3_UART_BAUD       9600  // Стандартная скорость для Tuya (может быть 9600 или 115200)
+#define WBR3_UART_NUM UART_NUM_0
+#define WBR3_UART_BAUD                                                         \
+  9600 // Стандартная скорость для Tuya (может быть 9600 или 115200)
 // ВАЖНО: Проверьте ваши пины! В рабочей прошивке используются GPIO20/21
-// Если используете GPIO20/21 как в рабочей прошивке, раскомментируйте следующие строки:
-#define WBR3_UART_TX_PIN     21    // ESP32-C3 GPIO21 → WBR3 RXD (ESP32 отправляет данные в WBR3)
-#define WBR3_UART_RX_PIN     20    // ESP32-C3 GPIO20 → WBR3 TXD (ESP32 получает данные от WBR3)
+// Если используете GPIO20/21 как в рабочей прошивке, раскомментируйте следующие
+// строки:
+#define WBR3_UART_TX_PIN                                                       \
+  21 // ESP32-C3 GPIO21 → WBR3 RXD (ESP32 отправляет данные в WBR3)
+#define WBR3_UART_RX_PIN                                                       \
+  20 // ESP32-C3 GPIO20 → WBR3 TXD (ESP32 получает данные от WBR3)
 // Если используете другие пины (например GPIO4/5), раскомментируйте:
 // #define WBR3_UART_TX_PIN     4
 // #define WBR3_UART_RX_PIN     5
-#define WBR3_BUF_SIZE        1024
+#define WBR3_BUF_SIZE 1024
 
 // Эти функции переопределяют те, что в protocol.c с #error
 // Функция отправки данных в UART (нужна для SDK)
@@ -39,560 +44,694 @@ static uint8_t tx_buffer[256];
 static int tx_buffer_pos = 0;
 static bool capturing_packet = false;
 
-void uart_transmit_output(unsigned char value)
-{
-    uart_write_bytes(WBR3_UART_NUM, &value, 1);
-    
-    // Захватываем начало пакета (55 AA)
-    if (!capturing_packet && value == 0x55) {
-        tx_buffer_pos = 0;
-        tx_buffer[tx_buffer_pos++] = value;
-        capturing_packet = true;
-    } else if (capturing_packet) {
-        tx_buffer[tx_buffer_pos++] = value;
-        
-        // Если это второй байт AA, начинаем захват
-        if (tx_buffer_pos == 2 && value == 0xAA) {
-            // Продолжаем захват
-        }
-        
-        // Если пакет завершен (после checksum), логируем
-        if (tx_buffer_pos >= 6) {
-            int packet_len = (tx_buffer[3] << 8) | tx_buffer[4];
-            int total_len = 6 + packet_len; // header + data + checksum
-            
-            if (tx_buffer_pos >= total_len) {
-                // Пакет завершен, логируем
-                ESP_LOGI(TAG, ">>> Sending packet to WBR3 (cmd=0x%02X, len=%d):", tx_buffer[3], packet_len);
-                for (int i = 0; i < total_len && i < 32; i++) {
-                    printf("%02X ", tx_buffer[i]);
-                    if ((i + 1) % 16 == 0) printf("\n");
-                }
-                printf("\n");
-                
-                // Определяем тип отправляемой команды
-                uint8_t cmd = tx_buffer[3];
-                const char* cmd_name = "UNKNOWN";
-                switch(cmd) {
-                    case 0x00: cmd_name = "HEARTBEAT_RESPONSE"; break;
-                    case 0x01: cmd_name = "PRODUCT_INFO_RESPONSE"; break;
-                    case 0x02: cmd_name = "WORK_MODE_RESPONSE"; break;
-                    case 0x03: cmd_name = "WIFI_STATE_RESPONSE"; break;
-                    case 0x07: cmd_name = "STATE_UPLOAD"; break;
-                }
-                ESP_LOGI(TAG, ">>> Sending: %s (cmd=0x%02X)", cmd_name, cmd);
-                
-                // Если это STATE_UPLOAD (0x07), это отправка DP данных в облако!
-                if (cmd == 0x07) {
-                    ESP_LOGI(TAG, ">>> ✓✓✓ DP DATA SENT TO CLOUD! ✓✓✓");
-                }
-                
-                capturing_packet = false;
-                tx_buffer_pos = 0;
-            }
-        }
-        
-        // Защита от переполнения
-        if (tx_buffer_pos >= sizeof(tx_buffer)) {
-            capturing_packet = false;
-            tx_buffer_pos = 0;
-        }
+void uart_transmit_output(unsigned char value) {
+  uart_write_bytes(WBR3_UART_NUM, &value, 1);
+
+  // Захватываем начало пакета (55 AA)
+  if (!capturing_packet && value == 0x55) {
+    tx_buffer_pos = 0;
+    tx_buffer[tx_buffer_pos++] = value;
+    capturing_packet = true;
+  } else if (capturing_packet) {
+    tx_buffer[tx_buffer_pos++] = value;
+
+    // Если это второй байт AA, начинаем захват
+    if (tx_buffer_pos == 2 && value == 0xAA) {
+      // Продолжаем захват
     }
+
+    // Если пакет завершен (после checksum), логируем
+    if (tx_buffer_pos >= 6) {
+      int packet_len = (tx_buffer[3] << 8) | tx_buffer[4];
+      int total_len = 6 + packet_len; // header + data + checksum
+
+      if (tx_buffer_pos >= total_len) {
+        // Пакет завершен, логируем
+        ESP_LOGI(TAG, ">>> Sending packet to WBR3 (cmd=0x%02X, len=%d):",
+                 tx_buffer[3], packet_len);
+        for (int i = 0; i < total_len && i < 32; i++) {
+          printf("%02X ", tx_buffer[i]);
+          if ((i + 1) % 16 == 0)
+            printf("\n");
+        }
+        printf("\n");
+
+        // Определяем тип отправляемой команды
+        uint8_t cmd = tx_buffer[3];
+        const char *cmd_name = "UNKNOWN";
+        switch (cmd) {
+        case 0x00:
+          cmd_name = "HEARTBEAT_RESPONSE";
+          break;
+        case 0x01:
+          cmd_name = "PRODUCT_INFO_RESPONSE";
+          break;
+        case 0x02:
+          cmd_name = "WORK_MODE_RESPONSE";
+          break;
+        case 0x03:
+          cmd_name = "WIFI_STATE_RESPONSE";
+          break;
+        case 0x07:
+          cmd_name = "STATE_UPLOAD";
+          break;
+        }
+        ESP_LOGI(TAG, ">>> Sending: %s (cmd=0x%02X)", cmd_name, cmd);
+
+        // Если это STATE_UPLOAD (0x07), это отправка DP данных в облако!
+        if (cmd == 0x07) {
+          ESP_LOGI(TAG, ">>> ✓✓✓ DP DATA SENT TO CLOUD! ✓✓✓");
+        }
+
+        capturing_packet = false;
+        tx_buffer_pos = 0;
+      }
+    }
+
+    // Защита от переполнения
+    if (tx_buffer_pos >= sizeof(tx_buffer)) {
+      capturing_packet = false;
+      tx_buffer_pos = 0;
+    }
+  }
 }
 
 // Глобальные переменные для хранения текущих значений DP
-// В реальном проекте эти значения должны обновляться из ваших датчиков/устройства
-static unsigned long current_temperature = 1;      // Текущая температура (°C) - можно использовать rand() % 100 для случайного значения
-static unsigned char current_status = 0;             // Текущий статус (enum): 0=charging, 1=discharging, 2=fault, 3=idle
-static unsigned long current_soc = 22;               // Текущий заряд батареи (%)
-static long battery_current = 20;  // Текущий ток батареи (мА) - тестируем с 200000 мА (200 А) для проверки обновления
+// В реальном проекте эти значения должны обновляться из ваших
+// датчиков/устройства
+static unsigned long current_temperature =
+    1; // Текущая температура (°C) - можно использовать rand() % 100 для
+       // случайного значения
+static unsigned char current_status =
+    0; // Текущий статус (enum): 0=charging, 1=discharging, 2=fault, 3=idle
+static unsigned long current_soc = 22; // Текущий заряд батареи (%)
+static long battery_current = 20;      // Текущий ток батареи (мА) - тестируем с
+                                  // 200000 мА (200 А) для проверки обновления
 static unsigned long battery_voltage = 3700; // Текущее напряжение батареи (мВ)
 
 // Функция обработки всех данных (нужна для SDK)
 // Вызывается при STATE_QUERY_CMD (0x08) - WBR3 запрашивает все DP состояния
-void all_data_update(void)
-{
-    ESP_LOGI(TAG, "all_data_update called - reporting all DP states");
-    
-    // ВАЖНО: Здесь должны быть актуальные значения из вашего устройства!
-    // Например:
-    // - Температура из датчика температуры
-    // - Статус из логики вашего устройства
-    // - Данные батареи из BMS или мониторинга питания
-    
-    // DPID_STATE_OF_CHARGE (101) - Battery Percentage
-    // Range: 0-100, Scale: 0, Unit: %
-    ESP_LOGI(TAG, "  → Sending DP 101 (Battery Percentage): %lu%%", current_soc);
-    unsigned char ret = mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
-    if (ret == SUCCESS) {
-        ESP_LOGI(TAG, "  ✓ DP 101 sent successfully");
-    } else {
-        ESP_LOGW(TAG, "  ✗ DP 101 update failed");
-    }
-    
-    // DPID_BATTERY_CURRENT (102) - Battery Current
-    // Пробуем отправлять напрямую БЕЗ умножения на 1000
-    // Range: -200000-200000, Scale: 0, Unit: mA - отправляем миллиамперы напрямую
-    // Если приложение показывает 110 мА постоянно, возможно проблема в настройках DP в Tuya Developer Platform
-    long current_value_signed = battery_current; // Отправляем напрямую в мА
-    union {
-        long signed_val;
-        unsigned long unsigned_val;
-    } current_union;
-    current_union.signed_val = current_value_signed;
-    unsigned long current_value = current_union.unsigned_val;
-    float current_amps = battery_current / 1000.0f;
-    ESP_LOGI(TAG, "  → Sending DP 102 (Battery Current): %ld mA (%.3f A)", 
-             battery_current, current_amps);
-    ESP_LOGI(TAG, "     Sending directly: %lu (0x%08lX) - NO multiplication by 1000", 
-             current_value, current_value);
-    ret = mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
-    if (ret == SUCCESS) {
-        ESP_LOGI(TAG, "  ✓ DP 102 sent successfully");
-    } else {
-        ESP_LOGW(TAG, "  ✗ DP 102 update failed");
-    }
-    
-    // DPID_STATUS (103) - Status (Enum)
-    // Enum: charging(0), discharging(1), fault(2), idle(3)
-    // current_status = 0 означает "charging", 1 = "discharging"
-    const char* status_names[] = {"charging", "discharging", "fault", "idle"};
-    ESP_LOGI(TAG, "  → Sending DP 103 (Status): %d (%s)", current_status, 
-             current_status < 4 ? status_names[current_status] : "unknown");
-    ret = mcu_dp_enum_update(DPID_STATUS, current_status);
-    if (ret == SUCCESS) {
-        ESP_LOGI(TAG, "  ✓ DP 103 sent successfully");
-    } else {
-        ESP_LOGW(TAG, "  ✗ DP 103 update failed");
-    }
-    
-    // DPID_COOK_TEMPERATURE (104) - Cook Temperature
-    // Range: -50-100, Scale: 0, Unit: °C
-    // Отправляем значение как есть (45)
-    ESP_LOGI(TAG, "  → Sending DP 104 (Cook Temperature): %lu°C (raw value: %lu)", 
-             current_temperature, current_temperature);
-    ret = mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
-    if (ret == SUCCESS) {
-        ESP_LOGI(TAG, "  ✓ DP 104 sent successfully");
-    } else {
-        ESP_LOGW(TAG, "  ✗ DP 104 update failed");
-    }
-    
-    // DPID_BATTERY_VOLTAGE (105) - Battery Voltage
-    // Range: 0-100, Scale: 1, Unit: V
-    // ВАЖНО: Scale: 1 означает 1 знак после запятой (0.1 точность)
-    // 3700 мВ = 3.7 В, с Scale: 1 отправляем 37 (3.7 * 10)
-    // Пробуем отправить в вольтах * 10
-    float voltage_volts = battery_voltage / 1000.0f; // 3700 мВ = 3.7 В
-    // Вариант 1: стандартный (3.7 В * 10 = 37)
-    unsigned long voltage_value = (unsigned long)(voltage_volts * 10); // 3.7 * 10 = 37
-    ESP_LOGI(TAG, "  → Sending DP 105 (Battery Voltage): %lu mV (%.2f V) -> sending %lu (V*10)", 
-             battery_voltage, voltage_volts, voltage_value);
-    ret = mcu_dp_value_update(DPID_BATTERY_VOLTAGE, voltage_value);
-    
-    // Если все еще показывает 0.0V, попробуйте раскомментировать один из вариантов ниже:
-    // unsigned long voltage_value = (unsigned long)(voltage_volts * 100); // 370 (V*100)
-    // unsigned long voltage_value = battery_voltage / 10; // 370 (мВ/10)
-    if (ret == SUCCESS) {
-        ESP_LOGI(TAG, "  ✓ DP 105 sent successfully");
-    } else {
-        ESP_LOGW(TAG, "  ✗ DP 105 update failed");
-    }
-    
-    ESP_LOGI(TAG, "All DP states reported successfully");
-    ESP_LOGI(TAG, "Check logs for 'STATE_UPLOAD' packets - these are sent to cloud!");
+void all_data_update(void) {
+  ESP_LOGI(TAG, "all_data_update called - reporting all DP states");
+
+  // ВАЖНО: Здесь должны быть актуальные значения из вашего устройства!
+  // Например:
+  // - Температура из датчика температуры
+  // - Статус из логики вашего устройства
+  // - Данные батареи из BMS или мониторинга питания
+
+  // DPID_STATE_OF_CHARGE (101) - Battery Percentage
+  // Range: 0-100, Scale: 0, Unit: %
+  ESP_LOGI(TAG, "  → Sending DP 101 (Battery Percentage): %lu%%", current_soc);
+  unsigned char ret = mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
+  if (ret == SUCCESS) {
+    ESP_LOGI(TAG, "  ✓ DP 101 sent successfully");
+  } else {
+    ESP_LOGW(TAG, "  ✗ DP 101 update failed");
+  }
+
+  // DPID_BATTERY_CURRENT (102) - Battery Current
+  // Пробуем отправлять напрямую БЕЗ умножения на 1000
+  // Range: -200000-200000, Scale: 0, Unit: mA - отправляем миллиамперы напрямую
+  // Если приложение показывает 110 мА постоянно, возможно проблема в настройках
+  // DP в Tuya Developer Platform
+  long current_value_signed = battery_current; // Отправляем напрямую в мА
+  union {
+    long signed_val;
+    unsigned long unsigned_val;
+  } current_union;
+  current_union.signed_val = current_value_signed;
+  unsigned long current_value = current_union.unsigned_val;
+  float current_amps = battery_current / 1000.0f;
+  ESP_LOGI(TAG, "  → Sending DP 102 (Battery Current): %ld mA (%.3f A)",
+           battery_current, current_amps);
+  ESP_LOGI(TAG,
+           "     Sending directly: %lu (0x%08lX) - NO multiplication by 1000",
+           current_value, current_value);
+  ret = mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
+  if (ret == SUCCESS) {
+    ESP_LOGI(TAG, "  ✓ DP 102 sent successfully");
+  } else {
+    ESP_LOGW(TAG, "  ✗ DP 102 update failed");
+  }
+
+  // DPID_STATUS (103) - Status (Enum)
+  // Enum: charging(0), discharging(1), fault(2), idle(3)
+  // current_status = 0 означает "charging", 1 = "discharging"
+  const char *status_names[] = {"charging", "discharging", "fault", "idle"};
+  ESP_LOGI(TAG, "  → Sending DP 103 (Status): %d (%s)", current_status,
+           current_status < 4 ? status_names[current_status] : "unknown");
+  ret = mcu_dp_enum_update(DPID_STATUS, current_status);
+  if (ret == SUCCESS) {
+    ESP_LOGI(TAG, "  ✓ DP 103 sent successfully");
+  } else {
+    ESP_LOGW(TAG, "  ✗ DP 103 update failed");
+  }
+
+  // DPID_COOK_TEMPERATURE (104) - Cook Temperature
+  // Range: -50-100, Scale: 0, Unit: °C
+  // Отправляем значение как есть (45)
+  ESP_LOGI(TAG, "  → Sending DP 104 (Cook Temperature): %lu°C (raw value: %lu)",
+           current_temperature, current_temperature);
+  ret = mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
+  if (ret == SUCCESS) {
+    ESP_LOGI(TAG, "  ✓ DP 104 sent successfully");
+  } else {
+    ESP_LOGW(TAG, "  ✗ DP 104 update failed");
+  }
+
+  // DPID_BATTERY_VOLTAGE (105) - Battery Voltage
+  // Range: 0-100, Scale: 1, Unit: V
+  // ВАЖНО: Scale: 1 означает 1 знак после запятой (0.1 точность)
+  // 3700 мВ = 3.7 В, с Scale: 1 отправляем 37 (3.7 * 10)
+  // Пробуем отправить в вольтах * 10
+  float voltage_volts = battery_voltage / 1000.0f; // 3700 мВ = 3.7 В
+  // Вариант 1: стандартный (3.7 В * 10 = 37)
+  unsigned long voltage_value =
+      (unsigned long)(voltage_volts * 10); // 3.7 * 10 = 37
+  ESP_LOGI(TAG,
+           "  → Sending DP 105 (Battery Voltage): %lu mV (%.2f V) -> sending "
+           "%lu (V*10)",
+           battery_voltage, voltage_volts, voltage_value);
+  ret = mcu_dp_value_update(DPID_BATTERY_VOLTAGE, voltage_value);
+
+  // Если все еще показывает 0.0V, попробуйте раскомментировать один из
+  // вариантов ниже: unsigned long voltage_value = (unsigned long)(voltage_volts
+  // * 100); // 370 (V*100) unsigned long voltage_value = battery_voltage / 10;
+  // // 370 (мВ/10)
+  if (ret == SUCCESS) {
+    ESP_LOGI(TAG, "  ✓ DP 105 sent successfully");
+  } else {
+    ESP_LOGW(TAG, "  ✗ DP 105 update failed");
+  }
+
+  ESP_LOGI(TAG, "All DP states reported successfully");
+  ESP_LOGI(TAG,
+           "Check logs for 'STATE_UPLOAD' packets - these are sent to cloud!");
 }
 
-// Вспомогательные функции для обновления значений DP (можно вызывать из других частей кода)
-// Эти функции можно использовать для обновления значений при изменении данных
-void update_temperature(unsigned long temp)
-{
-    current_temperature = temp;
-    mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
-    ESP_LOGI(TAG, "Temperature updated: %lu°C", current_temperature);
+// Вспомогательные функции для обновления значений DP (можно вызывать из других
+// частей кода) Эти функции можно использовать для обновления значений при
+// изменении данных
+void update_temperature(unsigned long temp) {
+  current_temperature = temp;
+  mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
+  ESP_LOGI(TAG, "Temperature updated: %lu°C", current_temperature);
 }
 
-void update_status(unsigned char status)
-{
-    current_status = status;
-    mcu_dp_enum_update(DPID_STATUS, current_status);
-    ESP_LOGI(TAG, "Status updated: %d", current_status);
+void update_status(unsigned char status) {
+  current_status = status;
+  mcu_dp_enum_update(DPID_STATUS, current_status);
+  ESP_LOGI(TAG, "Status updated: %d", current_status);
 }
 
-void update_battery_data(unsigned long soc, long current, unsigned long voltage)
-{
-    current_soc = soc;
-    battery_current = current;
-    battery_voltage = voltage;
-    
-    mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
-    // Отправляем Battery Current напрямую в мА (Range: -200000-200000, Scale: 0, Unit: mA)
-    long current_value_signed = battery_current;
-    union {
-        long signed_val;
-        unsigned long unsigned_val;
-    } current_union;
-    current_union.signed_val = current_value_signed;
-    unsigned long current_value = current_union.unsigned_val;
-    mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
-    mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage); // Scale: 1, вольты * 10
-    
-    ESP_LOGI(TAG, "Battery data updated: SOC=%lu%%, I=%ld mA, U=%lu mV", 
-             current_soc, battery_current, battery_voltage);
+void update_battery_data(unsigned long soc, long current,
+                         unsigned long voltage) {
+  current_soc = soc;
+  battery_current = current;
+  battery_voltage = voltage;
+
+  mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
+  // Отправляем Battery Current напрямую в мА (Range: -200000-200000, Scale: 0,
+  // Unit: mA)
+  long current_value_signed = battery_current;
+  union {
+    long signed_val;
+    unsigned long unsigned_val;
+  } current_union;
+  current_union.signed_val = current_value_signed;
+  unsigned long current_value = current_union.unsigned_val;
+  mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
+  mcu_dp_value_update(DPID_BATTERY_VOLTAGE,
+                      battery_voltage); // Scale: 1, вольты * 10
+
+  ESP_LOGI(TAG, "Battery data updated: SOC=%lu%%, I=%ld mA, U=%lu mV",
+           current_soc, battery_current, battery_voltage);
 }
 
 // Вспомогательная функция для обработки температуры (нужна для protocol.c)
-static unsigned char dp_download_cook_temperature_handle(const unsigned char value[], unsigned short length)
-{
-    ESP_LOGI(TAG, "Cook temperature: len=%d", length);
-    return 1; // SUCCESS
+static unsigned char
+dp_download_cook_temperature_handle(const unsigned char value[],
+                                    unsigned short length) {
+  ESP_LOGI(TAG, "Cook temperature: len=%d", length);
+  return 1; // SUCCESS
 }
 
 // Обработка DP команд (нужна для SDK)
-unsigned char dp_download_handle(unsigned char dpid, const unsigned char value[], unsigned short length)
-{
-    ESP_LOGI(TAG, "DP download: dpid=%d, len=%d", dpid, length);
-    
-    // Обработка конкретных DP
-    switch(dpid) {
-        case 101: // DPID_STATE_OF_CHARGE - Battery Percentage (можно изменять из приложения)
-            ESP_LOGI(TAG, "Battery Percentage changed from app");
-            return 1; // SUCCESS
-        case 104: // DPID_COOK_TEMPERATURE - Cook Temperature (можно изменять из приложения)
-            return dp_download_cook_temperature_handle(value, length);
-        default:
-            ESP_LOGI(TAG, "Unknown DP: %d", dpid);
-            return 1; // SUCCESS
-    }
+unsigned char dp_download_handle(unsigned char dpid,
+                                 const unsigned char value[],
+                                 unsigned short length) {
+  ESP_LOGI(TAG, "DP download: dpid=%d, len=%d", dpid, length);
+
+  // Обработка конкретных DP
+  switch (dpid) {
+  case 101: // DPID_STATE_OF_CHARGE - Battery Percentage (можно изменять из
+            // приложения)
+    ESP_LOGI(TAG, "Battery Percentage changed from app");
+    return 1; // SUCCESS
+  case 104:   // DPID_COOK_TEMPERATURE - Cook Temperature (можно изменять из
+              // приложения)
+    return dp_download_cook_temperature_handle(value, length);
+  default:
+    ESP_LOGI(TAG, "Unknown DP: %d", dpid);
+    return 1; // SUCCESS
+  }
 }
 
-extern "C" void app_main(void)
-{
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "WBR3 Test for ESP32-C3");
-    ESP_LOGI(TAG, "========================================");
-    
-    // Инициализация JK BMS
-    ESP_LOGI(TAG, "Initializing JK BMS...");
-    if (jk_bms_init()) {
-        ESP_LOGI(TAG, "JK BMS initialized, connecting...");
-        // Подключаемся к BMS (можно сделать в отдельной задаче)
-        jk_bms_connect();
-    } else {
-        ESP_LOGE(TAG, "Failed to initialize JK BMS");
-    }
-    
-    // Настройка UART
-    uart_config_t uart_config = {
-        .baud_rate = WBR3_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .rx_flow_ctrl_thresh = 0,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-    
-    // ВАЖНО: Устанавливаем буферы ПЕРЕД установкой пинов
-    // RX буфер должен быть достаточно большим для приема данных
-    ESP_ERROR_CHECK(uart_driver_install(WBR3_UART_NUM, WBR3_BUF_SIZE * 2, WBR3_BUF_SIZE * 2, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(WBR3_UART_NUM, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(WBR3_UART_NUM, WBR3_UART_TX_PIN, WBR3_UART_RX_PIN, 
-                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    
-    ESP_LOGI(TAG, "UART initialized: TX=%d, RX=%d, BAUD=%d", 
-             WBR3_UART_TX_PIN, WBR3_UART_RX_PIN, WBR3_UART_BAUD);
-    
-    // Проверка UART - очистка буферов
-    uart_flush(WBR3_UART_NUM);
-    ESP_LOGI(TAG, "UART buffers flushed");
-    
-    // Инициализация протокола Tuya
-    ESP_LOGI(TAG, "Initializing Tuya protocol...");
-    wifi_protocol_init();
-    ESP_LOGI(TAG, "Protocol initialized");
-    
-    // Пауза перед началом (даем WBR3 время на инициализацию)
-    ESP_LOGI(TAG, "Waiting for WBR3 to initialize...");
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    
-    // Проверяем текущее состояние WiFi перед запуском SmartConfig
-    // ВАЖНО: Не запускаем SmartConfig сразу - даем WBR3 время восстановить сохраненные настройки
-    ESP_LOGI(TAG, "Checking WiFi connection status...");
-    ESP_LOGI(TAG, "Waiting for WBR3 to restore saved WiFi settings (up to 10 seconds)...");
-    
-    // Даем больше времени WBR3 обработать запросы и восстановить состояние
-    // WBR3 должен автоматически восстановить сохраненные WiFi настройки
-    // Проверяем состояние WiFi несколько раз с увеличивающимися интервалами
-    unsigned char wifi_state = WIFI_SATE_UNKNOW;
-    bool wifi_configured = false;
-    
-    for (int i = 0; i < 100; i++) {  // До 10 секунд (100 * 100ms)
-        wifi_uart_service();
-        vTaskDelay(pdMS_TO_TICKS(100));
-        
-        // Проверяем состояние WiFi каждые 500ms
-        if (i % 5 == 0) {
-            wifi_state = mcu_get_wifi_work_state();
-            
-            // Если устройство подключено к облаку или WiFi, значит настройки сохранены
-            if (wifi_state == WIFI_CONN_CLOUD || wifi_state == WIFI_CONNECTED) {
-                wifi_configured = true;
-                ESP_LOGI(TAG, "WiFi connection restored! State: 0x%02X", wifi_state);
-                break;
-            }
-            
-            // Если устройство в режиме SmartConfig или AP, значит настройки не сохранены
-            if (wifi_state == SMART_CONFIG_STATE || wifi_state == AP_STATE) {
-                ESP_LOGI(TAG, "WiFi not configured. State: 0x%02X", wifi_state);
-                break;
-            }
-        }
-    }
-    
-    // Финальная проверка состояния WiFi
-    wifi_state = mcu_get_wifi_work_state();
-    ESP_LOGI(TAG, "Final WiFi state: 0x%02X", wifi_state);
-    
-    // Запускаем SmartConfig ТОЛЬКО если устройство не подключено к облаку/WiFi
-    // И если устройство явно в режиме настройки (SMART_CONFIG или AP)
-    // НЕ запускаем SmartConfig, если состояние неизвестно - даем больше времени
-    if (wifi_state == SMART_CONFIG_STATE || wifi_state == AP_STATE || 
-        (wifi_state == WIFI_NOT_CONNECTED && !wifi_configured)) {
-        ESP_LOGI(TAG, "WiFi not connected. Starting SmartConfig mode...");
-        ESP_LOGI(TAG, "To connect WBR3 to WiFi:");
-        ESP_LOGI(TAG, "  1. Open Tuya Smart app on your phone");
-        ESP_LOGI(TAG, "  2. Add device -> WiFi device");
-        ESP_LOGI(TAG, "  3. Enter your WiFi password");
-        ESP_LOGI(TAG, "  4. WBR3 will connect automatically");
-        mcu_set_wifi_mode(0); // 0 = SMART_CONFIG mode
-        vTaskDelay(pdMS_TO_TICKS(500));
-    } else if (wifi_state == WIFI_CONN_CLOUD || wifi_state == WIFI_CONNECTED) {
-        ESP_LOGI(TAG, "WiFi already configured! Device should reconnect automatically.");
-        ESP_LOGI(TAG, "No need to enter SmartConfig mode.");
-    } else if (wifi_state == WIFI_SATE_UNKNOW || wifi_state == WIFI_LOW_POWER) {
-        ESP_LOGI(TAG, "WiFi state unknown or in low power mode. Waiting for connection...");
-        ESP_LOGI(TAG, "Device may be trying to reconnect. Not starting SmartConfig.");
-        ESP_LOGI(TAG, "If device doesn't connect, it will need to be added again in Tuya app.");
-    } else {
-        ESP_LOGI(TAG, "WiFi state: 0x%02X. Waiting for connection...", wifi_state);
-    }
-    
-    // Проверяем, есть ли данные в буфере
-    size_t available = 0;
-    uart_get_buffered_data_len(WBR3_UART_NUM, &available);
-    if (available > 0) {
-        ESP_LOGI(TAG, "Found %d bytes in UART buffer (clearing)", available);
-        uart_flush_input(WBR3_UART_NUM);
-    }
-    
-    ESP_LOGI(TAG, "Starting main loop...");
-    ESP_LOGI(TAG, "Waiting for heartbeat from WBR3...");
-    ESP_LOGI(TAG, "Current UART speed: %d baud", WBR3_UART_BAUD);
-    ESP_LOGI(TAG, "If no data received, check:");
-    ESP_LOGI(TAG, "  1. UART speed matches WBR3 (currently %d, change WBR3_UART_BAUD if needed)", WBR3_UART_BAUD);
-    ESP_LOGI(TAG, "  2. TX/RX pins are connected correctly");
-    ESP_LOGI(TAG, "  3. WBR3 is powered (3.3V)");
-    
-    // Тестовая отправка - отправляем тестовый байт для проверки TX
-    ESP_LOGI(TAG, "Sending test byte to check TX line...");
-    uint8_t test_byte = 0x55;
-    uart_write_bytes(WBR3_UART_NUM, &test_byte, 1);
+extern "C" void app_main(void) {
+  ESP_LOGI(TAG, "========================================");
+  ESP_LOGI(TAG, "WBR3 Test for ESP32-C3");
+  ESP_LOGI(TAG, "========================================");
+
+  // Инициализация JK BMS
+  ESP_LOGI(TAG, "Initializing JK BMS...");
+  if (jk_bms_init()) {
+    ESP_LOGI(TAG, "JK BMS initialized, connecting...");
+    // Подключаемся к BMS (можно сделать в отдельной задаче)
+    jk_bms_connect();
+  } else {
+    ESP_LOGE(TAG, "Failed to initialize JK BMS");
+  }
+
+  // Настройка UART
+  uart_config_t uart_config = {
+      .baud_rate = WBR3_UART_BAUD,
+      .data_bits = UART_DATA_8_BITS,
+      .parity = UART_PARITY_DISABLE,
+      .stop_bits = UART_STOP_BITS_1,
+      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+      .rx_flow_ctrl_thresh = 0,
+      .source_clk = UART_SCLK_DEFAULT,
+  };
+
+  // ВАЖНО: Устанавливаем буферы ПЕРЕД установкой пинов
+  // RX буфер должен быть достаточно большим для приема данных
+  ESP_ERROR_CHECK(uart_driver_install(WBR3_UART_NUM, WBR3_BUF_SIZE * 2,
+                                      WBR3_BUF_SIZE * 2, 0, NULL, 0));
+  ESP_ERROR_CHECK(uart_param_config(WBR3_UART_NUM, &uart_config));
+  ESP_ERROR_CHECK(uart_set_pin(WBR3_UART_NUM, WBR3_UART_TX_PIN,
+                               WBR3_UART_RX_PIN, UART_PIN_NO_CHANGE,
+                               UART_PIN_NO_CHANGE));
+
+  ESP_LOGI(TAG, "UART initialized: TX=%d, RX=%d, BAUD=%d", WBR3_UART_TX_PIN,
+           WBR3_UART_RX_PIN, WBR3_UART_BAUD);
+
+  // Проверка UART - очистка буферов
+  uart_flush(WBR3_UART_NUM);
+  ESP_LOGI(TAG, "UART buffers flushed");
+
+  // Инициализация протокола Tuya
+  ESP_LOGI(TAG, "Initializing Tuya protocol...");
+  wifi_protocol_init();
+  ESP_LOGI(TAG, "Protocol initialized");
+
+  // Пауза перед началом (даем WBR3 время на инициализацию)
+  ESP_LOGI(TAG, "Waiting for WBR3 to initialize...");
+  vTaskDelay(pdMS_TO_TICKS(2000));
+
+  // Проверяем текущее состояние WiFi перед запуском SmartConfig
+  // ВАЖНО: Не запускаем SmartConfig сразу - даем WBR3 время восстановить
+  // сохраненные настройки
+  ESP_LOGI(TAG, "Checking WiFi connection status...");
+  ESP_LOGI(
+      TAG,
+      "Waiting for WBR3 to restore saved WiFi settings (up to 10 seconds)...");
+
+  // Даем больше времени WBR3 обработать запросы и восстановить состояние
+  // WBR3 должен автоматически восстановить сохраненные WiFi настройки
+  // Проверяем состояние WiFi несколько раз с увеличивающимися интервалами
+  unsigned char wifi_state = WIFI_SATE_UNKNOW;
+  bool wifi_configured = false;
+
+  for (int i = 0; i < 100; i++) { // До 10 секунд (100 * 100ms)
+    wifi_uart_service();
     vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Проверяем состояние RX пина (может помочь диагностике)
-    gpio_set_direction((gpio_num_t)WBR3_UART_RX_PIN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode((gpio_num_t)WBR3_UART_RX_PIN, GPIO_PULLUP_ONLY);
-    int rx_level = gpio_get_level((gpio_num_t)WBR3_UART_RX_PIN);
-    ESP_LOGI(TAG, "RX pin (GPIO%d) level: %d (1=idle/high, 0=low)", WBR3_UART_RX_PIN, rx_level);
-    if (rx_level == 0) {
-        ESP_LOGW(TAG, "WARNING: RX pin is LOW - check connection or WBR3 power!");
-    }
-    
-    uint8_t data[256];
-    int len;
-    int total_received = 0;
-    int loop_count = 0;
-    
-    // Главный цикл
-    while (1) {
-        loop_count++;
-        
-        // Периодически выводим статус
-        if (loop_count % 500 == 0) {
-            size_t available = 0;
-            uart_get_buffered_data_len(WBR3_UART_NUM, &available);
-            ESP_LOGI(TAG, "Loop %d: total received=%d, buffer=%d bytes", 
-                     loop_count, total_received, available);
-        }
-        
-        // Чтение данных из UART - простая логика как в рабочей прошивке
-        // Читаем все доступные данные
-        len = uart_read_bytes(WBR3_UART_NUM, data, sizeof(data) - 1, pdMS_TO_TICKS(50));
-        
-        if (len > 0) {
-            total_received += len;
-            
-            // Логируем все данные для диагностики
-            ESP_LOGI(TAG, "Received %d bytes (total: %d)", len, total_received);
-            
-            // Вывод hex дампа для отладки
-            ESP_LOGI(TAG, "Raw data (hex):");
-            for (int i = 0; i < len && i < 64; i++) {
-                printf("%02X ", data[i]);
-                if ((i + 1) % 16 == 0) printf("\n");
-            }
-            if (len <= 64) printf("\n");
-            printf("\n");
-            
-            // КРИТИЧНО: Передаем ВСЕ данные в SDK для обработки
-            // SDK сам соберет пакеты из отдельных байтов и отфильтрует мусор
-            // НЕ фильтруем байты сами - SDK знает формат пакетов лучше нас!
-            for (int i = 0; i < len; i++) {
-                uart_receive_input(data[i]);
-            }
-            
-            // Определяем тип команды от WBR3 (только для логирования)
-            if (len >= 6 && data[0] == 0x55 && data[1] == 0xAA) {
-                uint8_t cmd = data[3];
-                const char* cmd_name = "UNKNOWN";
-                switch(cmd) {
-                    case 0x00: cmd_name = "HEARTBEAT"; break;
-                    case 0x01: cmd_name = "PRODUCT_INFO"; break;
-                    case 0x02: cmd_name = "WORK_MODE"; break;
-                    case 0x03: cmd_name = "WIFI_STATE"; break;
-                    case 0x06: cmd_name = "DATA_QUERY"; break;
-                    case 0x07: cmd_name = "STATE_UPLOAD"; break;
-                    case 0x08: cmd_name = "STATE_QUERY"; break;
-                }
-                ESP_LOGI(TAG, ">>> Command received: %s (0x%02X)", cmd_name, cmd);
-                
-                // Проверяем статус WiFi из WIFI_STATE команды
-                if (cmd == 0x03 && len >= 8) {
-                    uint8_t wifi_state = data[6];
-                    const char* wifi_state_name = "UNKNOWN";
-                    switch(wifi_state) {
-                        case 0x00: wifi_state_name = "SMART_CONFIG"; break;
-                        case 0x01: wifi_state_name = "AP_MODE"; break;
-                        case 0x02: wifi_state_name = "WIFI_NOT_CONNECTED"; break;
-                        case 0x03: wifi_state_name = "WIFI_CONNECTED"; break;
-                        case 0x04: wifi_state_name = "WIFI_CONN_CLOUD"; break;  // Подключено к облаку!
-                        case 0x05: wifi_state_name = "LOW_POWER"; break;
-                        case 0x06: wifi_state_name = "SMART_AP_MODE"; break;
-                    }
-                    ESP_LOGI(TAG, ">>> WiFi State: %s (0x%02X)", wifi_state_name, wifi_state);
-                    if (wifi_state == 0x04) {
-                        ESP_LOGI(TAG, ">>> ✓✓✓ CONNECTED TO TUYA CLOUD! Data will be sent! ✓✓✓");
-                    } else if (wifi_state == 0x03) {
-                        ESP_LOGW(TAG, ">>> ⚠ WiFi connected but NOT to cloud yet");
-                    } else {
-                        ESP_LOGW(TAG, ">>> ⚠ WiFi NOT connected - data won't reach cloud");
-                    }
-                }
-            }
-        }
-        
-        // ВАЖНО: wifi_uart_service должен вызываться постоянно,
-        // даже если данных нет (для обработки таймеров и отправки ответов)
-        wifi_uart_service();
-        
-        // Периодически обновляем данные от JK BMS
-        if (loop_count % 500 == 0) {
-            jk_bms_update();
-            
-            // Получаем данные от BMS и обновляем все значения
-            jk_bms_data_t bms_data;
-            if (jk_bms_get_data(&bms_data)) {
-                ESP_LOGI(TAG, "=== BMS Data: SOC=%d%%, Voltage=%.2fV, Current=%.2fA, Temp=%.1f°C ===",
-                         bms_data.soc, bms_data.voltage, bms_data.current, bms_data.temperature);
-                // Обновляем все значения из реальных данных BMS
-                current_soc = bms_data.soc;
-                battery_voltage = (unsigned long)(bms_data.voltage * 100);  // V * 100 -> mV
-                battery_current = (long)(bms_data.current * 1000);  // A -> mA
-                current_temperature = (unsigned long)bms_data.temperature;
-                
-                // Отправляем обновленные значения в Tuya
-                ESP_LOGI(TAG, "=== Updating Tuya with BMS data ===");
-                mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
-                mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage / 100);
-                
-                // Отправляем ток с правильной обработкой знака
-                long current_value_signed = battery_current;
-                union {
-                    long signed_val;
-                    unsigned long unsigned_val;
-                } current_union;
-                current_union.signed_val = current_value_signed;
-                unsigned long current_value = current_union.unsigned_val;
-                mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
-                
-                mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
-                ESP_LOGI(TAG, "=== Tuya values updated: SOC=%d%%, V=%lumV, I=%ldmA, T=%lu°C ===",
-                         current_soc, battery_voltage, battery_current, current_temperature);
-            } else {
-                jk_bms_status_t status = jk_bms_get_status();
-                if (status == JK_BMS_DISCONNECTED) {
-                    ESP_LOGW(TAG, "BMS disconnected, attempting to reconnect...");
-                    jk_bms_connect();
-                }
-            }
-        }
-        
-        // Периодически отправляем обновления DP значений (особенно для Battery Current)
-        // Это гарантирует, что значения обновляются даже если STATE_QUERY не приходит
-        if (loop_count % 1000 == 0) {
-            // Принудительно отправляем Battery Current для тестирования
-            // Отправляем напрямую в мА (Range: -200000-200000, Scale: 0, Unit: mA)
-            long current_value_signed = battery_current;
-            union {
-                long signed_val;
-                unsigned long unsigned_val;
-            } current_union;
-            current_union.signed_val = current_value_signed;
-            unsigned long current_value = current_union.unsigned_val;
-            float current_amps = battery_current / 1000.0f;
-            ESP_LOGI(TAG, "=== Periodic update: Battery Current = %ld mA (%.3f A) -> sending %lu ===", 
-                     battery_current, current_amps, current_value);
-            unsigned char ret = mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
-            ESP_LOGI(TAG, "=== Periodic update result: %d (1=SUCCESS) ===", ret);
-            
-            // Также отправляем все остальные DP для синхронизации
-            mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
-            mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
-            mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage / 100);
-        }
-        
-        // Периодически проверяем статус WiFi подключения
-        if (loop_count % 500 == 0) {
-            unsigned char wifi_state = mcu_get_wifi_work_state();
-            const char* wifi_state_name = "UNKNOWN";
-            switch(wifi_state) {
-                case 0x00: wifi_state_name = "SMART_CONFIG"; break;
-                case 0x01: wifi_state_name = "AP_MODE"; break;
-                case 0x02: wifi_state_name = "WIFI_NOT_CONNECTED"; break;
-                case 0x03: wifi_state_name = "WIFI_CONNECTED"; break;
-                case 0x04: wifi_state_name = "WIFI_CONN_CLOUD"; break;  // Подключено к облаку!
-                case 0x05: wifi_state_name = "LOW_POWER"; break;
-                case 0x06: wifi_state_name = "SMART_AP_MODE"; break;
-            }
-            ESP_LOGI(TAG, "WiFi Status Check: %s (0x%02X)", wifi_state_name, wifi_state);
-            if (wifi_state == 0x04) {
-                ESP_LOGI(TAG, ">>> ✓✓✓ CONNECTED TO TUYA CLOUD - Data will be sent! ✓✓✓");
-            } else if (wifi_state == 0x03) {
-                ESP_LOGW(TAG, ">>> ⚠ WiFi connected but NOT to cloud yet");
-            } else if (wifi_state == 0x00) {
-                ESP_LOGI(TAG, ">>> 📱 SmartConfig mode - Use Tuya Smart app to connect WiFi");
-            } else if (wifi_state == 0x05) {
-                ESP_LOGW(TAG, ">>> ⚠ LOW_POWER mode - Device may be trying to reconnect");
-                // НЕ запускаем SmartConfig автоматически - даем устройству время восстановить подключение
-                // WBR3 должен сам попытаться переподключиться с сохраненными настройками
-            } else {
-                ESP_LOGW(TAG, ">>> ⚠ WiFi NOT connected - data won't reach cloud");
-            }
-        }
-        
-        // Небольшая задержка для стабильности
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
 
+    // Проверяем состояние WiFi каждые 500ms
+    if (i % 5 == 0) {
+      wifi_state = mcu_get_wifi_work_state();
+
+      // Если устройство подключено к облаку или WiFi, значит настройки
+      // сохранены
+      if (wifi_state == WIFI_CONN_CLOUD || wifi_state == WIFI_CONNECTED) {
+        wifi_configured = true;
+        ESP_LOGI(TAG, "WiFi connection restored! State: 0x%02X", wifi_state);
+        break;
+      }
+
+      // Если устройство в режиме SmartConfig или AP, значит настройки не
+      // сохранены
+      if (wifi_state == SMART_CONFIG_STATE || wifi_state == AP_STATE) {
+        ESP_LOGI(TAG, "WiFi not configured. State: 0x%02X", wifi_state);
+        break;
+      }
+    }
+  }
+
+  // Финальная проверка состояния WiFi
+  wifi_state = mcu_get_wifi_work_state();
+  ESP_LOGI(TAG, "Final WiFi state: 0x%02X", wifi_state);
+
+  // Запускаем SmartConfig ТОЛЬКО если устройство не подключено к облаку/WiFi
+  // И если устройство явно в режиме настройки (SMART_CONFIG или AP)
+  // НЕ запускаем SmartConfig, если состояние неизвестно - даем больше времени
+  if (wifi_state == SMART_CONFIG_STATE || wifi_state == AP_STATE ||
+      (wifi_state == WIFI_NOT_CONNECTED && !wifi_configured)) {
+    ESP_LOGI(TAG, "WiFi not connected. Starting SmartConfig mode...");
+    ESP_LOGI(TAG, "To connect WBR3 to WiFi:");
+    ESP_LOGI(TAG, "  1. Open Tuya Smart app on your phone");
+    ESP_LOGI(TAG, "  2. Add device -> WiFi device");
+    ESP_LOGI(TAG, "  3. Enter your WiFi password");
+    ESP_LOGI(TAG, "  4. WBR3 will connect automatically");
+    mcu_set_wifi_mode(0); // 0 = SMART_CONFIG mode
+    vTaskDelay(pdMS_TO_TICKS(500));
+  } else if (wifi_state == WIFI_CONN_CLOUD || wifi_state == WIFI_CONNECTED) {
+    ESP_LOGI(TAG,
+             "WiFi already configured! Device should reconnect automatically.");
+    ESP_LOGI(TAG, "No need to enter SmartConfig mode.");
+  } else if (wifi_state == WIFI_SATE_UNKNOW || wifi_state == WIFI_LOW_POWER) {
+    ESP_LOGI(
+        TAG,
+        "WiFi state unknown or in low power mode. Waiting for connection...");
+    ESP_LOGI(TAG,
+             "Device may be trying to reconnect. Not starting SmartConfig.");
+    ESP_LOGI(TAG, "If device doesn't connect, it will need to be added again "
+                  "in Tuya app.");
+  } else {
+    ESP_LOGI(TAG, "WiFi state: 0x%02X. Waiting for connection...", wifi_state);
+  }
+
+  // Проверяем, есть ли данные в буфере
+  size_t available = 0;
+  uart_get_buffered_data_len(WBR3_UART_NUM, &available);
+  if (available > 0) {
+    ESP_LOGI(TAG, "Found %d bytes in UART buffer (clearing)", available);
+    uart_flush_input(WBR3_UART_NUM);
+  }
+
+  ESP_LOGI(TAG, "Starting main loop...");
+  ESP_LOGI(TAG, "Waiting for heartbeat from WBR3...");
+  ESP_LOGI(TAG, "Current UART speed: %d baud", WBR3_UART_BAUD);
+  ESP_LOGI(TAG, "If no data received, check:");
+  ESP_LOGI(TAG,
+           "  1. UART speed matches WBR3 (currently %d, change WBR3_UART_BAUD "
+           "if needed)",
+           WBR3_UART_BAUD);
+  ESP_LOGI(TAG, "  2. TX/RX pins are connected correctly");
+  ESP_LOGI(TAG, "  3. WBR3 is powered (3.3V)");
+
+  // Тестовая отправка - отправляем тестовый байт для проверки TX
+  ESP_LOGI(TAG, "Sending test byte to check TX line...");
+  uint8_t test_byte = 0x55;
+  uart_write_bytes(WBR3_UART_NUM, &test_byte, 1);
+  vTaskDelay(pdMS_TO_TICKS(100));
+
+  // Проверяем состояние RX пина (может помочь диагностике)
+  gpio_set_direction((gpio_num_t)WBR3_UART_RX_PIN, GPIO_MODE_INPUT);
+  gpio_set_pull_mode((gpio_num_t)WBR3_UART_RX_PIN, GPIO_PULLUP_ONLY);
+  int rx_level = gpio_get_level((gpio_num_t)WBR3_UART_RX_PIN);
+  ESP_LOGI(TAG, "RX pin (GPIO%d) level: %d (1=idle/high, 0=low)",
+           WBR3_UART_RX_PIN, rx_level);
+  if (rx_level == 0) {
+    ESP_LOGW(TAG, "WARNING: RX pin is LOW - check connection or WBR3 power!");
+  }
+
+  uint8_t data[256];
+  int len;
+  int total_received = 0;
+  int loop_count = 0;
+
+  // Змінні для відстеження стану BMS та SOC
+  static bool bms_connected_prev = false;
+  static unsigned long prev_soc =
+      0xFFFFFFFF; // Ініціалізуємо неможливим значенням для першої відправки
+  static bool first_data_sent = false;
+  static bool data_requested = false; // Флаг: чи запитали мы данные от BMS
+
+  // Главный цикл
+  while (1) {
+    loop_count++;
+
+    // Периодически выводим статус
+    if (loop_count % 500 == 0) {
+      size_t available = 0;
+      uart_get_buffered_data_len(WBR3_UART_NUM, &available);
+      ESP_LOGI(TAG, "Loop %d: total received=%d, buffer=%d bytes", loop_count,
+               total_received, available);
+    }
+
+    // Чтение данных из UART - простая логика как в рабочей прошивке
+    // Читаем все доступные данные
+    len = uart_read_bytes(WBR3_UART_NUM, data, sizeof(data) - 1,
+                          pdMS_TO_TICKS(50));
+
+    if (len > 0) {
+      total_received += len;
+
+      // Логируем все данные для диагностики
+      ESP_LOGI(TAG, "Received %d bytes (total: %d)", len, total_received);
+
+      // Вывод hex дампа для отладки
+      ESP_LOGI(TAG, "Raw data (hex):");
+      for (int i = 0; i < len && i < 64; i++) {
+        printf("%02X ", data[i]);
+        if ((i + 1) % 16 == 0)
+          printf("\n");
+      }
+      if (len <= 64)
+        printf("\n");
+      printf("\n");
+
+      // КРИТИЧНО: Передаем ВСЕ данные в SDK для обработки
+      // SDK сам соберет пакеты из отдельных байтов и отфильтрует мусор
+      // НЕ фильтруем байты сами - SDK знает формат пакетов лучше нас!
+      for (int i = 0; i < len; i++) {
+        uart_receive_input(data[i]);
+      }
+
+      // Определяем тип команды от WBR3 (только для логирования)
+      if (len >= 6 && data[0] == 0x55 && data[1] == 0xAA) {
+        uint8_t cmd = data[3];
+        const char *cmd_name = "UNKNOWN";
+        switch (cmd) {
+        case 0x00:
+          cmd_name = "HEARTBEAT";
+          break;
+        case 0x01:
+          cmd_name = "PRODUCT_INFO";
+          break;
+        case 0x02:
+          cmd_name = "WORK_MODE";
+          break;
+        case 0x03:
+          cmd_name = "WIFI_STATE";
+          break;
+        case 0x06:
+          cmd_name = "DATA_QUERY";
+          break;
+        case 0x07:
+          cmd_name = "STATE_UPLOAD";
+          break;
+        case 0x08:
+          cmd_name = "STATE_QUERY";
+          break;
+        }
+        ESP_LOGI(TAG, ">>> Command received: %s (0x%02X)", cmd_name, cmd);
+
+        // Проверяем статус WiFi из WIFI_STATE команды
+        if (cmd == 0x03 && len >= 8) {
+          uint8_t wifi_state = data[6];
+          const char *wifi_state_name = "UNKNOWN";
+          switch (wifi_state) {
+          case 0x00:
+            wifi_state_name = "SMART_CONFIG";
+            break;
+          case 0x01:
+            wifi_state_name = "AP_MODE";
+            break;
+          case 0x02:
+            wifi_state_name = "WIFI_NOT_CONNECTED";
+            break;
+          case 0x03:
+            wifi_state_name = "WIFI_CONNECTED";
+            break;
+          case 0x04:
+            wifi_state_name = "WIFI_CONN_CLOUD";
+            break; // Подключено к облаку!
+          case 0x05:
+            wifi_state_name = "LOW_POWER";
+            break;
+          case 0x06:
+            wifi_state_name = "SMART_AP_MODE";
+            break;
+          }
+          ESP_LOGI(TAG, ">>> WiFi State: %s (0x%02X)", wifi_state_name,
+                   wifi_state);
+          if (wifi_state == 0x04) {
+            ESP_LOGI(TAG,
+                     ">>> ✓✓✓ CONNECTED TO TUYA CLOUD! Data will be sent! ✓✓✓");
+          } else if (wifi_state == 0x03) {
+            ESP_LOGW(TAG, ">>> ⚠ WiFi connected but NOT to cloud yet");
+          } else {
+            ESP_LOGW(TAG, ">>> ⚠ WiFi NOT connected - data won't reach cloud");
+          }
+        }
+      }
+    }
+
+    // ВАЖНО: wifi_uart_service должен вызываться постоянно,
+    // даже если данных нет (для обработки таймеров и отправки ответов)
+    wifi_uart_service();
+
+    // Отслеживаем подключение к BMS
+    jk_bms_status_t current_bms_status = jk_bms_get_status();
+
+    // Если только что подключились к BMS - запрашиваем данные сразу
+    if (current_bms_status == JK_BMS_CONNECTED && !bms_connected_prev) {
+      int64_t uptime_sec = esp_timer_get_time() / 1000000;
+      ESP_LOGI(
+          TAG,
+          "=== [%lld s] BMS just connected! Requesting initial data... ===",
+          uptime_sec);
+      jk_bms_update();
+      data_requested = true;
+      bms_connected_prev = true;
+    } else if (current_bms_status != JK_BMS_CONNECTED && bms_connected_prev) {
+      // BMS отключился
+      int64_t uptime_sec = esp_timer_get_time() / 1000000;
+      ESP_LOGW(TAG, "=== [%lld s] BMS disconnected ===", uptime_sec);
+      bms_connected_prev = false;
+    }
+
+    // Периодически обновляем данные от JK BMS (каждые 30 секунд)
+    // 3000 итераций × 10ms = 30 секунд
+    if (loop_count % 3000 == 0 && loop_count > 0 &&
+        current_bms_status == JK_BMS_CONNECTED) {
+      int64_t uptime_sec = esp_timer_get_time() / 1000000;
+      ESP_LOGI(TAG, "=== [%lld s] 30s cycle: Requesting BMS data... ===",
+               uptime_sec);
+      jk_bms_update();
+      data_requested = true;
+    }
+
+    // Проверяем наличие данных от BMS ТОЛЬКО если мы их запросили
+    if (data_requested) {
+      jk_bms_data_t bms_data;
+      if (jk_bms_get_data(&bms_data)) {
+        int64_t uptime_sec = esp_timer_get_time() / 1000000;
+        ESP_LOGI(TAG,
+                 "[%lld s] BMS Data: SOC=%d%%, Voltage=%.2fV, Current=%.2fA, "
+                 "Temp=%.1f°C",
+                 uptime_sec, bms_data.soc, bms_data.voltage, bms_data.current,
+                 bms_data.temperature);
+
+        // Обновляем внутренние переменные
+        current_soc = bms_data.soc;
+        battery_voltage =
+            (unsigned long)(bms_data.voltage * 100);       // V * 100 -> mV
+        battery_current = (long)(bms_data.current * 1000); // A -> mA
+        current_temperature = (unsigned long)bms_data.temperature;
+
+        // Отправляем в Tuya ТОЛЬКО если SOC изменился ИЛИ это первая отправка
+        if (current_soc != prev_soc || !first_data_sent) {
+          const char *reason = first_data_sent ? "SOC changed" : "First data";
+          ESP_LOGI(TAG,
+                   "=== [%lld s] SOC changed: %lu%% -> %lu%% (Reason: %s) ===",
+                   uptime_sec, prev_soc, current_soc, reason);
+          ESP_LOGI(TAG, "=== [%lld s] Updating Tuya with ALL BMS data ===",
+                   uptime_sec);
+
+          // Отправляем все параметры
+          mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
+          mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage / 100);
+
+          // Отправляем ток с правильной обработкой знака
+          long current_value_signed = battery_current;
+          union {
+            long signed_val;
+            unsigned long unsigned_val;
+          } current_union;
+          current_union.signed_val = current_value_signed;
+          unsigned long current_value = current_union.unsigned_val;
+          mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
+
+          mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
+
+          ESP_LOGI(TAG,
+                   "=== [%lld s] ✓ Tuya updated: SOC=%lu%%, V=%lumV, I=%ldmA, "
+                   "T=%lu°C ===",
+                   uptime_sec, current_soc, battery_voltage, battery_current,
+                   current_temperature);
+
+          // Обновляем предыдущее значение SOC
+          prev_soc = current_soc;
+          first_data_sent = true;
+        } else {
+          int64_t uptime_sec = esp_timer_get_time() / 1000000;
+          ESP_LOGD(TAG, "[%lld s] SOC unchanged (%lu%%), skipping Tuya update",
+                   uptime_sec, current_soc);
+        }
+
+        // Сбрасываем флаг запроса после получения данных
+        data_requested = false;
+      }
+    }
+
+    // Если BMS отключился - пытаемся переподключиться (каждые 30 секунд)
+    if (loop_count % 3000 == 0 && current_bms_status == JK_BMS_DISCONNECTED) {
+      int64_t uptime_sec = esp_timer_get_time() / 1000000;
+      ESP_LOGW(TAG, "[%lld s] BMS disconnected, attempting to reconnect...",
+               uptime_sec);
+      jk_bms_connect();
+    }
+
+    // Периодически проверяем статус WiFi подключения (каждые 30 секунд)
+    if (loop_count % 3000 == 0) {
+      unsigned char wifi_state = mcu_get_wifi_work_state();
+      const char *wifi_state_name = "UNKNOWN";
+      switch (wifi_state) {
+      case 0x00:
+        wifi_state_name = "SMART_CONFIG";
+        break;
+      case 0x01:
+        wifi_state_name = "AP_MODE";
+        break;
+      case 0x02:
+        wifi_state_name = "WIFI_NOT_CONNECTED";
+        break;
+      case 0x03:
+        wifi_state_name = "WIFI_CONNECTED";
+        break;
+      case 0x04:
+        wifi_state_name = "WIFI_CONN_CLOUD";
+        break; // Подключено к облаку!
+      case 0x05:
+        wifi_state_name = "LOW_POWER";
+        break;
+      case 0x06:
+        wifi_state_name = "SMART_AP_MODE";
+        break;
+      }
+      ESP_LOGI(TAG, "WiFi Status Check: %s (0x%02X)", wifi_state_name,
+               wifi_state);
+      if (wifi_state == 0x04) {
+        ESP_LOGI(TAG,
+                 ">>> ✓✓✓ CONNECTED TO TUYA CLOUD - Data will be sent! ✓✓✓");
+      } else if (wifi_state == 0x03) {
+        ESP_LOGW(TAG, ">>> ⚠ WiFi connected but NOT to cloud yet");
+      } else if (wifi_state == 0x00) {
+        ESP_LOGI(
+            TAG,
+            ">>> 📱 SmartConfig mode - Use Tuya Smart app to connect WiFi");
+      } else if (wifi_state == 0x05) {
+        ESP_LOGW(TAG,
+                 ">>> ⚠ LOW_POWER mode - Device may be trying to reconnect");
+      } else {
+        ESP_LOGW(TAG, ">>> ⚠ WiFi NOT connected - data won't reach cloud");
+      }
+    }
+
+    // Небольшая задержка для стабильности
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+}
