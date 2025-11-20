@@ -4,6 +4,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <cmath>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -204,21 +205,19 @@ void all_data_update(void) {
   // Range: 0-100, Scale: 1, Unit: V
   // ВАЖНО: Scale: 1 означает 1 знак после запятой (0.1 точность)
   // 3700 мВ = 3.7 В, с Scale: 1 отправляем 37 (3.7 * 10)
-  // Пробуем отправить в вольтах * 10
-  float voltage_volts = battery_voltage / 1000.0f; // 3700 мВ = 3.7 В
-  // Вариант 1: стандартный (3.7 В * 10 = 37)
-  unsigned long voltage_value =
-      (unsigned long)(voltage_volts * 10); // 3.7 * 10 = 37
+  // Пробуем отправить в вольтах * 100
+  // Scale: 2 означает 2 десятых (делить на 100)
+  // 5284 mV → Tuya покаже 5284 / 100 = 52.84V
+  unsigned long voltage_value = battery_voltage; // Отправляем напрямую в mV
   ESP_LOGI(TAG,
-           "  → Sending DP 105 (Battery Voltage): %lu mV (%.2f V) -> sending "
-           "%lu (V*10)",
-           battery_voltage, voltage_volts, voltage_value);
+           "  → Sending DP 105 (Battery Voltage): %lu mV (Scale=2, should show "
+           "%.2fV in app)",
+           voltage_value, voltage_value / 100.0f);
   ret = mcu_dp_value_update(DPID_BATTERY_VOLTAGE, voltage_value);
 
   // Если все еще показывает 0.0V, попробуйте раскомментировать один из
   // вариантов ниже: unsigned long voltage_value = (unsigned long)(voltage_volts
   // * 100); // 370 (V*100) unsigned long voltage_value = battery_voltage / 10;
-  // // 370 (мВ/10)
   if (ret == SUCCESS) {
     ESP_LOGI(TAG, "  ✓ DP 105 sent successfully");
   } else {
@@ -262,8 +261,13 @@ void update_battery_data(unsigned long soc, long current,
   current_union.signed_val = current_value_signed;
   unsigned long current_value = current_union.unsigned_val;
   mcu_dp_value_update(DPID_BATTERY_CURRENT, current_value);
+  unsigned long voltage_to_send = battery_voltage; // Отправляем напрямую в mV
+  ESP_LOGI(TAG,
+           "  → [dp_download] Sending voltage: %lu mV (Scale=2, should show "
+           "%.2fV in app)",
+           voltage_to_send, voltage_to_send / 100.0f);
   mcu_dp_value_update(DPID_BATTERY_VOLTAGE,
-                      battery_voltage); // Scale: 1, вольты * 10
+                      voltage_to_send); // Scale: 2
 
   ESP_LOGI(TAG, "Battery data updated: SOC=%lu%%, I=%ld mA, U=%lu mV",
            current_soc, battery_current, battery_voltage);
@@ -643,7 +647,14 @@ extern "C" void app_main(void) {
 
           // Отправляем все параметры
           mcu_dp_value_update(DPID_STATE_OF_CHARGE, current_soc);
-          mcu_dp_value_update(DPID_BATTERY_VOLTAGE, battery_voltage / 100);
+          unsigned long voltage_to_send =
+              battery_voltage; // Отправляем напрямую в mV
+          ESP_LOGI(TAG,
+                   "  → [main_loop] Sending voltage: %lu mV (Scale=2, should "
+                   "show %.2fV in app)",
+                   voltage_to_send, voltage_to_send / 100.0f);
+          mcu_dp_value_update(DPID_BATTERY_VOLTAGE,
+                              voltage_to_send); // Scale: 2
 
           // Отправляем ток с правильной обработкой знака
           long current_value_signed = battery_current;
@@ -658,10 +669,10 @@ extern "C" void app_main(void) {
           mcu_dp_value_update(DPID_COOK_TEMPERATURE, current_temperature);
 
           ESP_LOGI(TAG,
-                   "=== [%lld s] ✓ Tuya updated: SOC=%lu%%, V=%lumV, I=%ldmA, "
+                   "=== [%lld s] ✓ Tuya updated: SOC=%lu%%, V=%.1fV, I=%ldmA, "
                    "T=%lu°C ===",
-                   uptime_sec, current_soc, battery_voltage, battery_current,
-                   current_temperature);
+                   uptime_sec, current_soc, battery_voltage / 1000.0f,
+                   battery_current, current_temperature);
 
           // Обновляем предыдущее значение SOC
           prev_soc = current_soc;
